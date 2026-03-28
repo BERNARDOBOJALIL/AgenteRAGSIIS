@@ -1,0 +1,63 @@
+# Entorno virtual
+venv/
+env/
+.venv
+ENV/
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Cache y compilados Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Base de datos local
+chroma_db/
+*.db
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# IDE y editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# PDFs (opcional, si no quieres versionarlos)
+pdfs/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Node (si hay frontend)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Exports temporales
+exports/
+temp/
+tmp/
+
+# Datos sensibles
+secrets/
+credentials/

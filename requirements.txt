@@ -1,0 +1,14 @@
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-groq
+langchain-chroma
+langchain-text-splitters
+chromadb
+fastapi
+uvicorn
+pypdf
+beautifulsoup4
+requests
+python-dotenv
