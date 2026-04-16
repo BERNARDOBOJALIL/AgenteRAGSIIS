@@ -1120,6 +1120,295 @@ def _tokenize_for_match(text: str) -> set[str]:
     return set(tokens)
 
 
+def _normalize_lookup_token(value: Any) -> str:
+    return _normalize_text(value).replace(" ", "")
+
+
+def _parse_frontend_context(frontend_context: str | None) -> dict[str, Any]:
+    """Parsea el payload SIIS_FRONTEND_CONTEXT enviado por el frontend."""
+    raw = str(frontend_context or "").strip()
+    if not raw:
+        return {}
+
+    if raw.startswith("SIIS_FRONTEND_CONTEXT"):
+        _, sep, tail = raw.partition("\n")
+        raw = tail.strip() if sep else ""
+
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_frontend_candidate_labels(front_payload: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: Any) -> bool:
+        text = _clean_text(value)
+        if not text:
+            return False
+        key = _normalize_lookup_token(text)
+        if not key or key in seen:
+            return False
+        seen.add(key)
+        labels.append(text)
+        return True
+
+    route_guidance = front_payload.get("route_guidance")
+    if isinstance(route_guidance, dict):
+        has_destination = _push(route_guidance.get("destination"))
+        if not has_destination:
+            _push(route_guidance.get("origin"))
+
+    selected = front_payload.get("last_selected_salon")
+    if isinstance(selected, dict):
+        _push(selected.get("nomenclatura"))
+        _push(selected.get("nombre"))
+        _push(selected.get("name"))
+        _push(selected.get("rawName"))
+
+    relevant = front_payload.get("relevant_salones")
+    if isinstance(relevant, list):
+        for item in relevant:
+            if not isinstance(item, dict):
+                continue
+            _push(item.get("nomenclatura"))
+            _push(item.get("nombre"))
+
+    return labels
+
+
+def _build_front_route_summary(route_guidance: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+
+    origin = _clean_text(route_guidance.get("origin"))
+    destination = _clean_text(route_guidance.get("destination"))
+    floor = _clean_text(route_guidance.get("floor"))
+
+    if origin:
+        summary["origen"] = origin
+    if destination:
+        summary["destino"] = destination
+    if floor:
+        summary["piso_ruta"] = floor
+
+    left_turns = route_guidance.get("left_turns")
+    right_turns = route_guidance.get("right_turns")
+    if isinstance(left_turns, (int, float)):
+        summary["giros_izquierda"] = int(left_turns)
+    if isinstance(right_turns, (int, float)):
+        summary["giros_derecha"] = int(right_turns)
+
+    direction_steps = route_guidance.get("direction_steps")
+    if isinstance(direction_steps, list):
+        cleaned_steps = [_clean_text(step) for step in direction_steps if _clean_text(step)]
+        if cleaned_steps:
+            summary["pasos_direccion"] = cleaned_steps[:4]
+
+    steps = route_guidance.get("steps")
+    if isinstance(steps, list):
+        cleaned_steps = [_clean_text(step) for step in steps if _clean_text(step)]
+        if cleaned_steps:
+            summary["pasos_ruta"] = cleaned_steps[:6]
+
+    return summary
+
+
+def _lateral_hint_from_route_summary(route_summary: dict[str, Any]) -> str:
+    steps = route_summary.get("pasos_direccion")
+    joined_steps = _normalize_text(" ".join(steps)) if isinstance(steps, list) else ""
+
+    has_left = "izquierda" in joined_steps
+    has_right = "derecha" in joined_steps
+
+    left_turns = int(route_summary.get("giros_izquierda", 0) or 0)
+    right_turns = int(route_summary.get("giros_derecha", 0) or 0)
+
+    if has_left and not has_right:
+        return "hacia la izquierda"
+    if has_right and not has_left:
+        return "hacia la derecha"
+    if has_left and has_right:
+        return "siguiendo giros a izquierda y derecha"
+
+    if right_turns > left_turns and right_turns > 0:
+        return "hacia la derecha"
+    if left_turns > right_turns and left_turns > 0:
+        return "hacia la izquierda"
+    return ""
+
+
+def _zone_hint_from_location_text(location_text: Any) -> str:
+    normalized = _normalize_text(location_text)
+    if not normalized:
+        return ""
+
+    if "fondo" in normalized:
+        return "al fondo"
+    if "zona media" in normalized or "media del pasillo" in normalized:
+        return "a media altura del pasillo"
+    if "acceso principal" in normalized or "entrada" in normalized:
+        return "cerca de la entrada"
+    if "escalera" in normalized:
+        return "cerca de la escalera"
+    return ""
+
+
+def _build_simple_reference_for_salon(route_summary: dict[str, Any], salon_payload: dict[str, Any]) -> str:
+    if not isinstance(salon_payload, dict):
+        return ""
+
+    origin = _clean_text(route_summary.get("origen"))
+    lateral = _lateral_hint_from_route_summary(route_summary)
+    zone_hint = _zone_hint_from_location_text(salon_payload.get("ubicacion_aproximada"))
+    floor = _clean_text(salon_payload.get("piso"))
+
+    guidance_parts = [part for part in [lateral, zone_hint] if part]
+    guidance = ", ".join(guidance_parts)
+
+    main = ""
+    if origin and guidance:
+        main = f"Desde {origin}, avanza por el pasillo y sigue {guidance}."
+    elif origin:
+        main = f"Desde {origin}, avanza por el pasillo hasta la zona indicada."
+    elif guidance:
+        main = f"Ubicalo {guidance}."
+
+    if floor:
+        if main:
+            main += f" Esta en {floor}."
+        else:
+            main = f"Esta en {floor}."
+
+    return main.strip()
+
+
+def _build_frontend_route_db_cross_context(
+    front_payload: dict[str, Any],
+    salones_all: list[dict[str, Any]],
+    *,
+    include_schedule: bool,
+    max_matches: int = 3,
+) -> dict[str, Any]:
+    """Cruza contexto de ruta del frontend con salones de la BD para respuestas mas precisas."""
+    if not front_payload:
+        return {}
+
+    route_guidance = front_payload.get("route_guidance") if isinstance(front_payload.get("route_guidance"), dict) else {}
+    candidates = _extract_frontend_candidate_labels(front_payload)
+    candidate_norms = [_normalize_lookup_token(label) for label in candidates if _normalize_lookup_token(label)]
+    candidate_terms = _tokenize_for_match(" ".join(candidates))
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for item in salones_all:
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        nomenclatura = _clean_text(data.get("nomenclatura"))
+        nombre = _clean_text(data.get("nombre"))
+        nom_norm = _normalize_lookup_token(nomenclatura)
+        name_norm = _normalize_lookup_token(nombre)
+        blob = " ".join(part for part in [nom_norm, name_norm] if part)
+        if not blob:
+            continue
+
+        score = 0
+        for cand in candidate_norms:
+            if cand == nom_norm or cand == name_norm:
+                score += 10
+            elif cand and (cand in blob or blob in cand):
+                score += 5
+
+        for term in candidate_terms:
+            if term in blob:
+                score += 1
+
+        if score > 0:
+            scored.append((score, item))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    matched_items: list[dict[str, Any]] = []
+    seen_doc_ids: set[str] = set()
+    for _, item in scored:
+        doc_id = _clean_text(item.get("doc_id"))
+        if doc_id and doc_id in seen_doc_ids:
+            continue
+        if doc_id:
+            seen_doc_ids.add(doc_id)
+        matched_items.append(item)
+        if len(matched_items) >= max_matches:
+            break
+
+    cross_context: dict[str, Any] = {}
+    front_floor = _clean_text(front_payload.get("active_floor"))
+    if front_floor:
+        cross_context["piso_activo_front"] = front_floor
+
+    route_summary = _build_front_route_summary(route_guidance) if route_guidance else {}
+    if route_summary:
+        cross_context["ruta_front"] = route_summary
+
+    if matched_items:
+        matched_compact = [
+            _compact_salon_runtime_payload(item, include_schedule=include_schedule)
+            for item in matched_items
+        ]
+        cross_context["salones_ruta_cruzados"] = matched_compact
+
+        referencias = []
+        for salon in matched_compact:
+            referencia = _build_simple_reference_for_salon(route_summary, salon)
+            if not referencia:
+                continue
+            referencias.append(
+                {
+                    "salon": _clean_text(salon.get("nomenclatura") or salon.get("nombre") or salon.get("doc_id")),
+                    "referencia_simple": referencia,
+                }
+            )
+
+        if referencias:
+            cross_context["referencias_textuales_sugeridas"] = referencias
+
+    return cross_context
+
+
+def _serialize_object_with_char_budget(payload: dict[str, Any], max_chars: int) -> str:
+    """Serializa un objeto JSON sin exceder presupuesto; recorta listas grandes si hace falta."""
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= max_chars:
+        return encoded
+
+    compact = dict(payload)
+    salones = compact.get("salones_ruta_cruzados")
+    if isinstance(salones, list) and len(salones) > 1:
+        compact["salones_ruta_cruzados"] = salones[:2]
+        compact["truncated"] = True
+        encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) <= max_chars:
+            return encoded
+
+    route = compact.get("ruta_front")
+    if isinstance(route, dict) and "pasos_ruta" in route:
+        route = dict(route)
+        pasos = route.get("pasos_ruta")
+        if isinstance(pasos, list):
+            route["pasos_ruta"] = pasos[:3]
+        compact["ruta_front"] = route
+        compact["truncated"] = True
+
+    encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= max_chars:
+        return encoded
+
+    return json.dumps({"truncated": True}, ensure_ascii=False, separators=(",", ":"))
+
+
 def _record_blob(record: dict[str, Any]) -> str:
     flat = flatten_data(record)
     if not flat:
@@ -1155,9 +1444,16 @@ def _serialize_items_with_char_budget(items: list[dict[str, Any]], max_chars: in
     return payload, len(selected), len(items)
 
 
-def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_usuarios: int = 3) -> dict[str, Any]:
+def build_firebase_runtime_context(
+    question: str,
+    *,
+    max_salones: int = 3,
+    max_usuarios: int = 3,
+    frontend_context: str | None = None,
+) -> dict[str, Any]:
     """Construye contexto Firebase en vivo (sin Markdown) relevante para la pregunta."""
     schedule_details_requested = _question_requests_detailed_schedule(question)
+    front_payload = _parse_frontend_context(frontend_context)
 
     try:
         snapshot = fetch_firebase_live_snapshot()
@@ -1210,6 +1506,13 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         for item in selected_usuarios
     ]
 
+    frontend_cross_context = _build_frontend_route_db_cross_context(
+        front_payload,
+        salones_all,
+        include_schedule=schedule_details_requested,
+        max_matches=3,
+    )
+
     salones_json, salones_included, salones_total_selected = _serialize_items_with_char_budget(
         compact_salones,
         max_chars=4600,
@@ -1218,6 +1521,7 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         compact_usuarios,
         max_chars=2600,
     )
+    frontend_cross_json = _serialize_object_with_char_budget(frontend_cross_context, max_chars=1700)
 
     context_text = (
         "DATOS_OPERATIVOS_UNIVERSIDAD\n"
@@ -1229,7 +1533,9 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         "salones_relevantes_json=\n"
         f"{salones_json}\n"
         "usuarios_relevantes_json=\n"
-        f"{usuarios_json}"
+        f"{usuarios_json}\n"
+        "cruce_front_mapa_salones_json=\n"
+        f"{frontend_cross_json}"
     )
 
     return {
