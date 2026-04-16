@@ -11,6 +11,7 @@ Soporta:
 
 import time
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +21,6 @@ from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     PyPDFLoader,
     RecursiveUrlLoader,
-    WebBaseLoader,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -37,9 +37,10 @@ CHUNK_OVERLAP = 120
 def _limpiar_html(html: str) -> str:
     """Extrae texto limpio de HTML eliminando nav, footer, scripts y publicidad."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["nav", "footer", "header", "script", "style", "aside", "form"]):
+    for tag in soup(["nav", "footer", "header", "script", "style", "aside", "form", "noscript", "svg", "button"]):
         tag.decompose()
-    return soup.get_text(separator=" ", strip=True)
+    text = soup.get_text(separator="\n", strip=True)
+    return text
 
 
 # ── Scrapers individuales ──────────────────────────────────────────────────────
@@ -55,19 +56,49 @@ def scrape_estatico(urls: list[str], categoria: str = "web", delay: float = 1.0)
         delay:     Segundos de espera entre requests (ser amable con el servidor).
     """
     documentos = []
+    user_agent = os.getenv(
+        "USER_AGENT",
+        "Mozilla/5.0 (compatible; AgenteRAGSIIS/1.0; +https://www.iberopuebla.mx/IDIT)",
+    )
+
     for url in urls:
         try:
             log.info(f"Scrapeando (estático): {url}")
-            loader = WebBaseLoader(url)
-            loader.requests_kwargs = {"timeout": 15}
-            docs = loader.load()
-            for doc in docs:
-                doc.metadata["categoria"] = categoria
-                doc.metadata["fuente"] = "web_scraping"
-            documentos.extend(docs)
+
+            response = requests.get(
+                url,
+                timeout=20,
+                headers={"User-Agent": user_agent},
+            )
+            response.raise_for_status()
+
+            html = response.text
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.title.get_text(" ", strip=True) if soup.title else ""
+            cleaned_body = _limpiar_html(html)
+
+            page_content = f"{title}\n{cleaned_body}" if title else cleaned_body
+            if not page_content.strip():
+                log.warning(f"Sin contenido util en {url}")
+                continue
+
+            documentos.append(
+                Document(
+                    page_content=page_content,
+                    metadata={
+                        "categoria": categoria,
+                        "fuente": "web_scraping",
+                        "url": url,
+                        "source_url": url,
+                        "title": title,
+                    },
+                )
+            )
+
             time.sleep(delay)
         except Exception as e:
             log.warning(f"Error en {url}: {e}")
+
     return documentos
 
 

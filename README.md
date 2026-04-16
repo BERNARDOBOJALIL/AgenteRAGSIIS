@@ -1,215 +1,229 @@
-# 🎓 Agente RAG Universitario
+# Agente RAG SIIS IDIT
 
-Asistente inteligente para tu universidad construido con **LangChain + Chroma Cloud + Groq + Google Gemini**.
+Proyecto RAG en Python para responder consultas del IDIT con datos unificados desde:
 
----
+- Web scraping
+- PDFs
+- Firestore de salones IDIT (todo)
+- Firestore de usuarios (solo profesores)
 
-## Estructura del proyecto
+Todo se transforma a un formato Markdown consistente antes de indexarse en ChromaDB.
 
-```
-agente_universidad/
-├── ingest.py          # Alimenta la base de datos (ejecutar primero)
-├── agent.py           # Chat con el agente en terminal
-├── api.py             # API HTTP para frontend (FastAPI)
-├── scraper.py         # Lógica de web scraping y carga de documentos
-├── crud_chroma.py     # Operaciones CRUD sobre ChromaDB
-├── pdfs/              # (Opcional) PDFs para ingesta local
-├── chroma_db/         # (Opcional) DB local temporal para procesos de ingesta
+## Estructura
+
+```text
+AgenteRAGSIIS/
+├── agent.py
+├── api.py
+├── ingest.py
+├── scraper.py
+├── firebase_sources.py
+├── markdown_unifier.py
+├── normalize_chroma_markdown.py
+├── crud_chroma.py
 ├── requirements.txt
 └── .env
 ```
 
----
-
-## Instalación
+## Instalacion
 
 ```bash
-# 1. Crear entorno virtual
 python -m venv venv
-source venv/bin/activate        # Mac/Linux
-venv\Scripts\activate           # Windows
-
-# 2. Instalar dependencias
+venv\Scripts\activate
 pip install -r requirements.txt
-
-# 3. Copiar y configurar variables de entorno
-cp .env.example .env
-# Edita .env con tus API keys
 ```
 
----
+## Variables de entorno
 
-## Configuración de API Keys
-
-Edita el archivo `.env`:
+### Requeridas para embeddings y chat
 
 ```env
-GOOGLE_API_KEY=tu_key_de_google_ai_studio
-GROQ_API_KEY=tu_key_de_groq
-CHROMA_API_KEY=tu_key_de_chroma_cloud
-CHROMA_TENANT=tu_tenant_de_chroma
-CHROMA_DATABASE=RAG-BERNY
-CHROMA_CLOUD_HOST=api.trychroma.com    # opcional
-CHROMA_CLOUD_PORT=443                  # opcional
-LANGCHAIN_API_KEY=tu_key_de_langsmith   # opcional
-LANGSMITH_API_KEY=tu_key_de_langsmith   # opcional
+GOOGLE_API_KEY=...
+GROQ_API_KEY=...
 ```
 
-Obtén tu `GOOGLE_API_KEY` gratis en: https://aistudio.google.com/app/apikey
+### Chroma Cloud (si usas runtime cloud en agent.py/api.py)
 
----
-
-## Cómo alimentar la base de datos
-
-### 1. Desde PDFs
-
-Coloca tus archivos PDF en la carpeta `pdfs/`:
-```
-pdfs/
-├── reglamento_escolar.pdf
-├── oferta_academica.pdf
-└── servicios_universitarios.pdf
+```env
+CHROMA_API_KEY=...
+CHROMA_TENANT=...
+CHROMA_DATABASE=...
+CHROMA_CLOUD_HOST=api.trychroma.com
+CHROMA_CLOUD_PORT=443
 ```
 
-### 2. Desde web scraping
+### Firestore (ya presentes en tu .env actual)
 
-Edita `ingest.py` y agrega tus URLs:
+```env
+VITE_FIREBASE_API_KEY=...                 # usuarios
+VITE_FIREBASE_PROJECT_ID=...              # usuarios
 
-```python
-URLS_ESTATICAS = [
-    "https://www.miuniversidad.edu.mx/becas",
-    "https://www.miuniversidad.edu.mx/biblioteca",
-]
+VITE_FIREBASE_SALONES_API_KEY=...         # salones IDIT
+VITE_FIREBASE_SALONES_PROJECT_ID=...      # salones IDIT
 ```
 
-### 3. Datos manuales
+### Opcionales para ajustar extraccion Firestore
 
-Agrega información directa en `ingest.py`:
+```env
+FIREBASE_USUARIOS_COLLECTION=usuarios
+FIREBASE_HORARIOS_COLLECTION=horarios
+FIREBASE_INCLUDE_SUBCOLLECTIONS=true
+FIREBASE_MAX_TRAVERSAL_DEPTH=2
+FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH=none
 
-```python
-DATOS_MANUALES = [
-    {
-        "contenido": "La biblioteca abre de 8:00 a 21:00 de lunes a viernes.",
-        "categoria": "servicios",
-        "fuente": "manual",
-    },
-]
+FIREBASE_PROFESSOR_FIELD_MARKERS=rol,role,tipo_usuario,teacher,is_professor
+FIREBASE_PROFESSOR_VALUE_MARKERS=profesor,docente,teacher,faculty
 ```
 
-### 4. Ejecutar la ingestión
+Nota: la fuente de salones se recorre completa por defecto (todas las colecciones y documentos). Solo usa `FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH` si quieres limitar profundidad.
+
+## Formato Markdown unificado
+
+Todos los documentos indexados quedan en el mismo esquema:
+
+- Tipo de consulta
+- Titulo
+- Resumen
+- Informacion principal
+- Personal relacionado
+- Equipamiento
+- Ubicacion
+- Servicios
+- Datos estructurados
+- Fuente
+
+Cuando falta un dato, el sistema coloca exactamente:
+
+```text
+No poseemos esa infromacion.
+```
+
+## Tipos de consulta normalizados
+
+El normalizador clasifica cada documento en una de estas categorias:
+
+1. Informacion general de IDIT
+2. Informacion sobre personal, equipamiento y ubicaciones dentro del IDIT
+3. Informacion sobre servicios del IDIT
+
+## Ingesta principal
+
+### Ejecutar todo (web + PDF + Firestore + DOCX)
 
 ```bash
-# Primera vez o para agregar documentos nuevos
 python ingest.py
+```
 
-# Para borrar todo y empezar desde cero
+### Limpiar e indexar desde cero
+
+```bash
 python ingest.py --reset
 ```
 
----
+### Solo Firestore
 
-## Iniciar el chat en terminal
+```bash
+python ingest.py --skip-web --skip-pdf
+```
+
+### Solo web/PDF
+
+```bash
+python ingest.py --skip-firebase
+```
+
+### Definir carpeta de PDFs
+
+```bash
+python ingest.py --pdf-dir ./pdfs
+```
+
+### Convertir e ingerir DOCX
+
+Por defecto se buscan DOCX en la raiz del proyecto de forma recursiva.
+
+```bash
+python ingest.py --docx-dir ./
+```
+
+Para hacer solo DOCX:
+
+```bash
+python ingest.py --skip-web --skip-pdf --skip-firebase --docx-dir ./
+```
+
+### Subir directo a Chroma Cloud
+
+```bash
+python ingest.py --cloud
+```
+
+### Exportar documentos Markdown generados
+
+Por defecto se exportan en:
+
+```text
+./exports/markdown_ingesta
+```
+
+Puedes cambiarlo con:
+
+```bash
+python ingest.py --export-md-dir ./exports/md_custom
+```
+
+## Script para normalizar Chroma ya existente
+
+Si ya tienes datos previos de scraping en Chroma y quieres reacomodarlos al formato unificado:
+
+```bash
+python normalize_chroma_markdown.py
+```
+
+Por defecto:
+
+- Normaliza solo fuentes que parecen web scraping
+- Exporta Markdown en `./exports/chroma_normalizado`
+- Trabaja contra Chroma local (`./chroma_db`)
+
+Opciones comunes:
+
+```bash
+# Simular sin escribir cambios
+python normalize_chroma_markdown.py --dry-run
+
+# Normalizar todas las fuentes
+python normalize_chroma_markdown.py --all-sources
+
+# Reprocesar incluso los ya normalizados
+python normalize_chroma_markdown.py --force
+
+# Usar Chroma Cloud
+python normalize_chroma_markdown.py --cloud
+```
+
+## Cargar y convertir PDFs a Markdown
+
+La conversion PDF -> Markdown se hace automaticamente dentro de `ingest.py` usando `scraper.py` + `markdown_unifier.py`.
+
+Solo coloca tus PDFs en la carpeta indicada y ejecuta ingesta.
+
+## Ejecutar chat en terminal
 
 ```bash
 python agent.py
 ```
 
-```
-═══════════════════════════════════════════════════════
-  🎓 Asistente Universitario
-  Escribe 'salir' o 'exit' para terminar
-═══════════════════════════════════════════════════════
-
-Tú: ¿Cuáles son los requisitos para obtener una beca?
-Asistente: Para obtener una beca debes...
-```
-
-## Iniciar API para frontend (FastAPI)
+## Ejecutar API
 
 ```bash
 uvicorn api:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Endpoints principales:
-- `GET /health` → estado y cantidad de documentos en colección.
-- `POST /chat` → envía prompt y recibe respuesta.
-- `DELETE /chat/{session_id}` → limpia historial de esa sesión.
+Endpoints:
 
-Ejemplo request a `POST /chat`:
+- `GET /health`
+- `POST /chat`
+- `DELETE /chat/{session_id}`
 
-```json
-{
-  "prompt": "¿Qué es el IDIT?",
-  "session_id": "usuario-web-1"
-}
-```
-
-Ejemplo response:
-
-```json
-{
-  "response": "El IDIT es...",
-  "session_id": "usuario-web-1"
-}
-```
-
----
-
-## Categorías de metadatos recomendadas
-
-| `categoria`      | Tipo de contenido                          |
-|------------------|--------------------------------------------|
-| `reglamento`     | Artículos del reglamento escolar           |
-| `servicios`      | Biblioteca, cafetería, fotocopiadora       |
-| `laboratorios`   | Horarios y normas de laboratorios          |
-| `becas`          | Requisitos y convocatorias                 |
-| `inscripciones`  | Procedimientos y fechas                    |
-| `profesores`     | Horarios de asesorías y contactos          |
-| `deportes`       | Instalaciones y horarios                   |
-| `tramites`       | Constancias, historial académico           |
-
----
-
-## Sitios con JavaScript
-
-Si el sitio de tu universidad usa React/Angular, instala Playwright:
-
-```bash
-pip install playwright
-playwright install chromium
-```
-
-Y agrega las URLs en `URLS_DINAMICAS` dentro de `ingest.py`.
-
----
-
-## Flujo completo
-
-```
-PDFs / Web / Datos manuales
-         ↓
-     scraper.py
-    (limpieza + fragmentación)
-         ↓
-   GoogleGenerativeAIEmbeddings
-    (texto → vectores)
-         ↓
-      ChromaDB
-   (chroma_db/)
-         ↓
-    agent.py → chat
-```
-
----
-
-## Chroma Cloud
-
-El runtime actual de `agent.py` y `crud_chroma.py` consulta directamente la colección en Chroma Cloud.
-
-Para copiar datos locales a Cloud, usa la CLI oficial de Chroma:
-
-```bash
-chroma login
-chroma copy --all --from-local --path ./chroma_db --to-cloud --db RAG-BERNY
-```
 
