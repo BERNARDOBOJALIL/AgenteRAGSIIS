@@ -11,6 +11,7 @@ import os
 
 import chromadb
 from dotenv import load_dotenv
+from firebase_sources import build_firebase_runtime_context
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
@@ -28,16 +29,31 @@ CHROMA_CLOUD_HOST = os.getenv("CHROMA_CLOUD_HOST", "api.trychroma.com")
 CHROMA_CLOUD_PORT = int(os.getenv("CHROMA_CLOUD_PORT", "443"))
 
 SYSTEM_PROMPT = """Eres un asistente virtual amable y preciso de la universidad.
-Tu trabajo es responder preguntas de los alumnos usando ÚNICAMENTE la información
-disponible en la base de datos universitaria. 
+Tu trabajo es responder preguntas de los alumnos usando UNICAMENTE la informacion
+disponible en el contexto proporcionado.
 
-Reglas:
-- Si encuentras la información, respóndela de forma clara y concisa.
-- Si NO encuentras la información, dilo honestamente: "No tengo esa información disponible."
+Reglas obligatorias:
+- Responde siempre en espanol, claro y conciso.
+- Si no hay datos suficientes, responde exactamente: "No tengo esa información disponible."
 - Nunca inventes datos, horarios, nombres o requisitos.
+- Nunca menciones fuentes tecnicas, infraestructura o errores internos (Firebase, Chroma, API, JSON, permisos, logs, etc.).
+- Para preguntas de salones, prioriza equipamiento y ubicacion aproximada (piso, zona y referencias cercanas).
+- Solo comparte horario/calendario detallado cuando el usuario lo pida de forma explicita.
+- Si piden como llegar, da indicaciones aproximadas y humanas; evita una ruta exacta paso a paso.
 - Responde siempre en español.
-- Sé amable y usa un tono cercano pero profesional.
+- Se amable y usa un tono cercano pero profesional.
 """
+
+
+def _compact_frontend_context(frontend_context: str | None, *, max_chars: int = 1500) -> str:
+    """Compacta contexto opcional del frontend para no inflar tokens."""
+    if not frontend_context:
+        return ""
+
+    compact = " ".join(str(frontend_context).split())
+    if len(compact) <= max_chars:
+        return compact
+    return f"{compact[: max_chars - 3]}..."
 
 
 def inicializar_vector_store() -> Chroma:
@@ -58,17 +74,28 @@ def inicializar_vector_store() -> Chroma:
     )
 
 
-def generar_respuesta_rag(vector_store: Chroma, pregunta: str, historial: list[dict]) -> str:
-    """Responde con RAG directo (sin tool-calling) para mayor estabilidad."""
-    resultados = vector_store.similarity_search(pregunta, k=4)
-    if not resultados:
-        return "No tengo esa información disponible."
+def generar_respuesta_rag(
+    vector_store: Chroma,
+    pregunta: str,
+    historial: list[dict],
+    frontend_context: str | None = None,
+) -> str:
+    """Responde con RAG hibrido: Chroma (estatico) + Firebase en vivo (dinamico)."""
+    resultados = vector_store.similarity_search(pregunta, k=3)
 
-    contexto = []
+    contexto_chroma = []
     for doc in resultados:
         fuente = doc.metadata.get("fuente", "desconocida")
         categoria = doc.metadata.get("categoria", "general")
-        contexto.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
+        contexto_chroma.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
+
+    firebase_context = build_firebase_runtime_context(pregunta)
+    contexto_firebase = firebase_context.get("context_text", "")
+    frontend_context_txt = _compact_frontend_context(frontend_context)
+    solicitud_horario_detallado = bool(firebase_context.get("schedule_details_requested", False))
+
+    if not contexto_chroma and not contexto_firebase:
+        return "No tengo esa información disponible."
 
     historial_txt = ""
     if historial:
@@ -78,13 +105,25 @@ def generar_respuesta_rag(vector_store: Chroma, pregunta: str, historial: list[d
             lineas.append(f"Asistente: {turno['respuesta']}")
         historial_txt = "\n".join(lineas)
 
+    contexto_chroma_txt = "\n\n---\n\n".join(contexto_chroma) if contexto_chroma else "Sin contexto Chroma"
+    contexto_frontend_txt = frontend_context_txt if frontend_context_txt else "Sin contexto frontend"
+
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
-        "Instrucciones adicionales:\n"
+        "Instrucciones adicionales de prioridad:\n"
         "- Usa solo el contexto recuperado para responder.\n"
+        "- Para SALONES y para USUARIOS/HORARIOS/CALENDARIOS, prioriza FIREBASE_OPERATIVO.\n"
+        "- Para preguntas de ubicacion, responde con referencias aproximadas (inicio/medio/fondo, planta baja/alta, referencia de escalera si aplica).\n"
+        "- Si Contexto SIIS frontend incluye route_guidance, usa esos pasos para mencionar izquierda/derecha con consistencia y no inventes giros.\n"
+        "- Evita tecnicismos y evita explicar de donde se obtuvo la informacion.\n"
+        "- Si solicitud_horario_detallado=false, no listes bloques completos de horario; solo resume disponibilidad general o confirma si existe horario.\n"
+        "- Si solicitud_horario_detallado=true y hay datos, si puedes mostrar detalle de horario/calendario.\n"
         "- Si el contexto no alcanza, responde exactamente: 'No tengo esa información disponible.'\n\n"
+        f"solicitud_horario_detallado={str(solicitud_horario_detallado).lower()}\n\n"
         f"Conversación previa:\n{historial_txt if historial_txt else 'Sin historial'}\n\n"
-        f"Contexto:\n{'\n\n---\n\n'.join(contexto)}\n\n"
+        f"Contexto Chroma:\n{contexto_chroma_txt}\n\n"
+        f"Contexto Firebase operativo:\n{contexto_firebase if contexto_firebase else 'Sin contexto Firebase'}\n\n"
+        f"Contexto SIIS frontend:\n{contexto_frontend_txt}\n\n"
         f"Pregunta: {pregunta}"
     )
 

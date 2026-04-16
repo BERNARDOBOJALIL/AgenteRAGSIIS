@@ -5,9 +5,10 @@ Proyecto RAG en Python para responder consultas del IDIT con datos unificados de
 - Web scraping
 - PDFs
 - Firestore de salones IDIT (todo)
-- Firestore de usuarios (solo profesores)
+- Firestore de usuarios (rol academico + tipo profesor/administrativo)
 
-Todo se transforma a un formato Markdown consistente antes de indexarse en ChromaDB.
+Web/PDF/DOCX se transforman a Markdown para ChromaDB.
+Firestore se consulta en vivo en runtime del agente (sin convertir a Markdown).
 
 ## Estructura
 
@@ -67,15 +68,24 @@ VITE_FIREBASE_SALONES_PROJECT_ID=...      # salones IDIT
 ```env
 FIREBASE_USUARIOS_COLLECTION=usuarios
 FIREBASE_HORARIOS_COLLECTION=horarios
+FIREBASE_CALENDARIOS_COLLECTION=calendarios
 FIREBASE_INCLUDE_SUBCOLLECTIONS=true
 FIREBASE_MAX_TRAVERSAL_DEPTH=2
 FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH=none
 
 FIREBASE_PROFESSOR_FIELD_MARKERS=rol,role,tipo_usuario,teacher,is_professor
 FIREBASE_PROFESSOR_VALUE_MARKERS=profesor,docente,teacher,faculty
+FIREBASE_TARGET_ROLES=academico,académico
+FIREBASE_TARGET_TYPES=profesor,administrativo,aminisrativo
+FIREBASE_RUNTIME_CACHE_TTL_SECONDS=45
 ```
 
 Nota: la fuente de salones se recorre completa por defecto (todas las colecciones y documentos). Solo usa `FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH` si quieres limitar profundidad.
+
+Nota: en runtime, el agente consulta Firebase en vivo para:
+- Salones: toda la informacion disponible.
+- Usuarios: `rol=academico` y `tipo` profesor/administrativo (incluye variantes tipograficas).
+- Join por `doc_id` con colecciones de horarios y calendarios.
 
 ## Formato Markdown unificado
 
@@ -108,7 +118,7 @@ El normalizador clasifica cada documento en una de estas categorias:
 
 ## Ingesta principal
 
-### Ejecutar todo (web + PDF + Firestore + DOCX)
+### Ejecutar todo (web + PDF + DOCX)
 
 ```bash
 python ingest.py
@@ -120,16 +130,18 @@ python ingest.py
 python ingest.py --reset
 ```
 
-### Solo Firestore
-
-```bash
-python ingest.py --skip-web --skip-pdf
-```
-
 ### Solo web/PDF
 
 ```bash
 python ingest.py --skip-firebase
+```
+
+### Incluir Firestore en ingesta estatica (opcional)
+
+No es necesario para el agente en modo dinamico, pero queda disponible:
+
+```bash
+python ingest.py --include-firebase-static
 ```
 
 ### Definir carpeta de PDFs

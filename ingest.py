@@ -127,7 +127,7 @@ def _collect_docx_documents(*, docx_dir: str | None) -> list[Document]:
 def main(
     reset: bool = False,
     skip_web: bool = False,
-    skip_firebase: bool = False,
+    skip_firebase: bool = True,
     skip_pdf: bool = False,
     skip_docx: bool = False,
     pdf_dir: str = PDFS_DIR_DEFAULT,
@@ -251,7 +251,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Alimenta ChromaDB con documentos IDIT normalizados a Markdown.")
     parser.add_argument("--reset", action="store_true", help="Borra y recrea la base de datos.")
     parser.add_argument("--skip-web", action="store_true", help="Omite scraping web.")
-    parser.add_argument("--skip-firebase", action="store_true", help="Omite extraccion desde Firestore.")
+    parser.add_argument("--skip-firebase", action="store_true", help="Omite extraccion desde Firestore para ingesta estatica.")
+    parser.add_argument(
+        "--include-firebase-static",
+        action="store_false",
+        dest="skip_firebase",
+        help="Incluye Firestore en la ingesta estatica (no recomendado si usas Firebase en vivo en agent.py).",
+    )
     parser.add_argument("--skip-pdf", action="store_true", help="Omite carga de PDFs.")
     parser.add_argument("--skip-docx", action="store_true", help="Omite carga de DOCX.")
     parser.add_argument("--pdf-dir", default=PDFS_DIR_DEFAULT, help="Carpeta con PDFs para ingesta.")
@@ -268,6 +274,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Solo genera/actualiza archivos Markdown normalizados sin subir a ChromaDB.",
     )
+    parser.set_defaults(skip_firebase=True)
     args = parser.parse_args()
     main(
         reset=args.reset,

@@ -22,6 +22,7 @@ load_dotenv()
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4000)
     session_id: str = Field(default="default", min_length=1, max_length=128)
+    frontend_context: str | None = Field(default=None, max_length=4000)
 
 
 class ChatResponse(BaseModel):
@@ -82,7 +83,12 @@ def chat(body: ChatRequest) -> ChatResponse:
     historial = historiales.setdefault(body.session_id, [])
 
     try:
-        respuesta = generar_respuesta_rag(vector_store, body.prompt.strip(), historial)
+        respuesta = generar_respuesta_rag(
+            vector_store,
+            body.prompt.strip(),
+            historial,
+            frontend_context=(body.frontend_context or "").strip() or None,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando prompt: {e}") from e
 
