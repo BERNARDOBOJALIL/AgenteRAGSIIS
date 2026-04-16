@@ -120,6 +120,56 @@ SCHEDULE_DETAIL_MARKERS = {
 
 J_CODE_PATTERN = re.compile(r"\bJ[\s_-]?(\d{1,3})\b", flags=re.IGNORECASE)
 
+CONSERVATIVE_LAB_EQUIPMENT_HINTS: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
+    (
+        ("quimic",),
+        (
+            "campana de extraccion",
+            "tarja o lavabo de laboratorio",
+            "material basico para manejo de reactivos",
+        ),
+    ),
+    (
+        ("fisic",),
+        (
+            "bancos de trabajo",
+            "instrumentos de medicion",
+            "fuentes de alimentacion de laboratorio",
+        ),
+    ),
+    (
+        ("biolog", "microbiolog"),
+        (
+            "microscopios",
+            "mesas de preparacion",
+            "material de bioseguridad basica",
+        ),
+    ),
+    (
+        ("comput", "informat", "inteligencia artificial", "realidad aumentada", "datos"),
+        (
+            "computadoras de escritorio",
+            "proyector o pantalla",
+            "conectividad de red",
+        ),
+    ),
+    (
+        ("electron", "mecatron", "robot", "automat"),
+        (
+            "multimetros",
+            "fuentes de poder",
+            "estaciones de prototipado electronico",
+        ),
+    ),
+    (
+        ("fabricacion digital", "maker", "prototip", "impresion 3d", "corte laser"),
+        (
+            "equipos de prototipado digital",
+            "herramientas de taller supervisado",
+        ),
+    ),
+]
+
 
 @dataclass
 class FirestoreRecord:
@@ -316,6 +366,44 @@ def _build_salon_location_hint(salon_data: dict[str, Any]) -> str:
     return ", ".join(hints) if hints else "ubicacion aproximada no disponible"
 
 
+def _infer_conservative_equipment_from_lab_name(
+    *,
+    nombre: Any,
+    tipo: Any,
+    nomenclatura: Any,
+    max_items: int = 3,
+) -> list[str]:
+    """Infiere equipamiento probable de forma conservadora usando solo el nombre/tipo del laboratorio."""
+    nombre_txt = _normalize_text(nombre)
+    tipo_txt = _normalize_text(tipo)
+    nomenclatura_txt = _normalize_text(nomenclatura)
+    blob = " ".join(part for part in [nombre_txt, tipo_txt, nomenclatura_txt] if part).strip()
+
+    if not blob:
+        return []
+
+    if "laboratorio" not in blob and "laboratorio" not in tipo_txt:
+        return []
+
+    inferred: list[str] = []
+    seen: set[str] = set()
+
+    for keywords, suggestions in CONSERVATIVE_LAB_EQUIPMENT_HINTS:
+        if not any(keyword in blob for keyword in keywords):
+            continue
+
+        for suggestion in suggestions:
+            key = _normalize_text(suggestion)
+            if key in seen:
+                continue
+            seen.add(key)
+            inferred.append(suggestion)
+            if len(inferred) >= max_items:
+                return inferred
+
+    return inferred
+
+
 def _compact_nested_payload(value: Any, *, max_items: int = 12, max_depth: int = 2) -> Any:
     if max_depth < 0:
         return "..."
@@ -387,6 +475,16 @@ def _schedule_presence_summary(horario: Any, calendario: Any) -> str:
 
 def _compact_salon_runtime_payload(item: dict[str, Any], *, include_schedule: bool) -> dict[str, Any]:
     data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    equipamiento_real = _clean_string_list(data.get("equipamiento"), max_items=12)
+    equipamiento_inferido = []
+
+    if not equipamiento_real:
+        equipamiento_inferido = _infer_conservative_equipment_from_lab_name(
+            nombre=data.get("nombre"),
+            tipo=data.get("tipo"),
+            nomenclatura=data.get("nomenclatura"),
+            max_items=3,
+        )
 
     compact = {
         "doc_id": _clean_text(item.get("doc_id")),
@@ -395,7 +493,13 @@ def _compact_salon_runtime_payload(item: dict[str, Any], *, include_schedule: bo
         "tipo": _clean_text(data.get("tipo")),
         "piso": _normalize_floor_label(data.get("piso")),
         "ubicacion_aproximada": _build_salon_location_hint(data),
-        "equipamiento": _clean_string_list(data.get("equipamiento"), max_items=12),
+        "equipamiento": equipamiento_real,
+        "equipamiento_inferido_conservador": equipamiento_inferido,
+        "nota_inferencia_equipamiento": (
+            "estimacion conservadora basada en el nombre del laboratorio"
+            if equipamiento_inferido
+            else ""
+        ),
         "responsables": _extract_responsable_names(data.get("responsables"), max_items=4),
         "reserva": data.get("reserva"),
         "idConjunto": data.get("idConjunto"),
@@ -1116,7 +1220,7 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
     )
 
     context_text = (
-        "FIREBASE_OPERATIVO\n"
+        "DATOS_OPERATIVOS_UNIVERSIDAD\n"
         f"totales.salones={snapshot.get('totals', {}).get('salones', 0)}\n"
         f"totales.usuarios_objetivo={snapshot.get('totals', {}).get('usuarios_objetivo', 0)}\n"
         f"solicitud_horario_detallado={str(schedule_details_requested).lower()}\n"
