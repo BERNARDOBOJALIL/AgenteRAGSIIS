@@ -70,6 +70,9 @@ def _sanitize_user_facing_response(text: str) -> str:
         (r"de\s+acuerdo\s+con\s+firebase", "con la informacion disponible"),
         (r"seg[uú]n\s+(el\s+)?json", "con la informacion disponible"),
         (r"fired?base_operativo", ""),
+        (r"datos_operativos_universidad", ""),
+        (r"cruce_front_mapa_salones_json", ""),
+        (r"referencias_textuales_sugeridas", ""),
         (r"contexto\s+firebase", "informacion disponible"),
         (r"contexto\s+chroma", "informacion disponible"),
         (r"contexto\s+siis\s+frontend", "informacion disponible"),
@@ -119,7 +122,10 @@ def generar_respuesta_rag(
         categoria = doc.metadata.get("categoria", "general")
         contexto_chroma.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
 
-    firebase_context = build_firebase_runtime_context(pregunta)
+    firebase_context = build_firebase_runtime_context(
+        pregunta,
+        frontend_context=frontend_context,
+    )
     contexto_firebase = firebase_context.get("context_text", "")
     frontend_context_txt = _compact_frontend_context(frontend_context)
     solicitud_horario_detallado = bool(firebase_context.get("schedule_details_requested", False))
@@ -143,6 +149,8 @@ def generar_respuesta_rag(
         "Instrucciones adicionales de prioridad:\n"
         "- Usa solo el contexto recuperado para responder.\n"
         "- Para SALONES y para USUARIOS/HORARIOS/CALENDARIOS, prioriza DATOS_OPERATIVOS_UNIVERSIDAD.\n"
+        "- Usa cruce_front_mapa_salones_json para cruzar ruta/ubicacion del mapa con salones, equipamiento y responsables.\n"
+        "- Si hay referencias_textuales_sugeridas, usalas como base y responde con indicaciones simples tipo: 'a la derecha', 'a la izquierda', 'al fondo'.\n"
         "- Para preguntas de ubicacion, responde con referencias aproximadas (inicio/medio/fondo, planta baja/alta, referencia de escalera si aplica).\n"
         "- Si Contexto SIIS frontend incluye route_guidance, usa esos pasos para mencionar izquierda/derecha con consistencia y no inventes giros.\n"
         "- Si equipamiento viene vacio y existe equipamiento_inferido_conservador, responde en tono conservador "
