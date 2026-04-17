@@ -61,3 +61,7 @@ tmp/
 # Datos sensibles
 secrets/
 credentials/
+siis-9593c-611399213026.json
+siis-d3571-336618a9b5d1.json
+*firebase-adminsdk*.json
+*service-account*.json

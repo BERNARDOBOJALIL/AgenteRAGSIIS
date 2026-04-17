@@ -87,6 +87,40 @@ DEFAULT_TARGET_USER_TYPES = {
     "adminisrativa",
 }
 
+DEFAULT_STUDENT_MARKERS = {
+    "alumno",
+    "alumna",
+    "estudiante",
+    "student",
+}
+
+DEFAULT_SALONES_COLLECTION_ALLOWLIST = ["salones"]
+DEFAULT_USERS_COLLECTION_ALLOWLIST = [
+    "usuarios",
+    "horarios",
+    "horrios",
+    "calendarios",
+    "calendario",
+    "citas",
+    "cita",
+    "notificaciones",
+    "notificacion",
+    "notifications",
+]
+
+DEFAULT_CITAS_COLLECTION_CANDIDATES = ["citas", "cita", "appointments", "appointment"]
+DEFAULT_NOTIFICACIONES_COLLECTION_CANDIDATES = [
+    "notificaciones",
+    "notificacion",
+    "notifications",
+    "notification",
+]
+
+DEFAULT_LOCAL_SALONES_SERVICE_ACCOUNT_FILE = "siis-d3571-336618a9b5d1.json"
+DEFAULT_LOCAL_USERS_SERVICE_ACCOUNT_FILE = "siis-9593c-611399213026.json"
+
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DEFAULT_FIREBASE_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_RUNTIME_CACHE_TTL_SECONDS", "45"))
 
 _runtime_cache: dict[str, Any] = {
@@ -127,6 +161,19 @@ SCHEDULE_DETAIL_MARKERS = {
     "por dia",
     "semanal",
     "bloques",
+}
+
+SCHEDULE_QUERY_MARKERS = {
+    "que horario",
+    "que horarios",
+    "cual es el horario",
+    "cuales son los horarios",
+    "a que hora",
+    "disponible",
+    "disponibilidad",
+    "abre",
+    "cierra",
+    "cuando",
 }
 
 J_CODE_PATTERN = re.compile(r"\bJ[\s_-]?(\d{1,3})\b", flags=re.IGNORECASE)
@@ -204,6 +251,43 @@ def _collection_allowlist_env(*names: str) -> list[str] | None:
     return None
 
 
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _clean_text(value)
+        if not text:
+            continue
+        key = _normalize_lookup_token(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
+def _collection_candidates(configured: str, defaults: list[str]) -> list[str]:
+    return _dedupe_preserve_order([configured, *defaults])
+
+
+def _collection_leaf_name(value: Any) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    leaf = text.split("/")[-1]
+    return _normalize_lookup_token(leaf)
+
+
+def _resolve_path_candidates(path_value: str) -> list[str]:
+    expanded = os.path.expandvars(os.path.expanduser(path_value))
+    if os.path.isabs(expanded):
+        return [expanded]
+    return [
+        expanded,
+        os.path.join(MODULE_DIR, expanded),
+    ]
+
+
 def _datetime_to_iso(value: Any) -> str:
     if not value:
         return ""
@@ -218,21 +302,32 @@ def _service_account_from_env(
     *,
     file_var: str | None,
     json_var: str | None,
+    fallback_file_names: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Carga service account desde archivo o JSON/base64 en variables de entorno."""
     candidates: list[tuple[str | None, str]] = []
     if file_var:
         candidates.append((os.getenv(file_var, "").strip(), f"env:{file_var}"))
+
+    for file_name in fallback_file_names or []:
+        candidates.append((file_name, f"local_default:{file_name}"))
+
     candidates.append((os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(), "env:GOOGLE_APPLICATION_CREDENTIALS"))
 
     for path, source in candidates:
         if not path:
             continue
-        if not os.path.exists(path):
+        resolved_path = ""
+        for candidate_path in _resolve_path_candidates(path):
+            if os.path.exists(candidate_path):
+                resolved_path = candidate_path
+                break
+
+        if not resolved_path:
             log.warning("Ruta de credencial no existe (%s): %s", source, path)
             continue
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(resolved_path, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
                 return payload, source
@@ -297,6 +392,21 @@ def _optional_int_env(name: str, default: int | None) -> int | None:
         return default
 
 
+def _question_requests_schedule(question: str) -> bool:
+    """Detecta si el usuario pidio informacion de horario/calendario."""
+    normalized = _normalize_text(question)
+    if not normalized:
+        return False
+
+    if any(marker in normalized for marker in SCHEDULE_LITERAL_MARKERS):
+        return True
+
+    if any(marker in normalized for marker in SCHEDULE_QUERY_MARKERS):
+        return True
+
+    return any(marker in normalized for marker in SCHEDULE_TOPIC_MARKERS)
+
+
 def _question_requests_detailed_schedule(question: str) -> bool:
     """Detecta si el usuario pidio horario/calendario detallado de forma explicita."""
     normalized = _normalize_text(question)
@@ -306,7 +416,7 @@ def _question_requests_detailed_schedule(question: str) -> bool:
     if any(marker in normalized for marker in SCHEDULE_LITERAL_MARKERS):
         return True
 
-    has_topic = any(marker in normalized for marker in SCHEDULE_TOPIC_MARKERS)
+    has_topic = _question_requests_schedule(question)
     has_detail = any(marker in normalized for marker in SCHEDULE_DETAIL_MARKERS)
     return has_topic and has_detail
 
@@ -536,12 +646,21 @@ def _compact_horario_payload(horario: Any, *, max_items: int = 14) -> Any:
     return _compact_nested_payload(horario, max_items=max_items, max_depth=1)
 
 
-def _schedule_presence_summary(horario: Any, calendario: Any) -> str:
+def _schedule_presence_summary(
+    horario: Any,
+    calendario: Any,
+    citas: Any,
+    notificaciones: Any,
+) -> str:
     parts: list[str] = []
     if horario:
         parts.append("horario registrado")
     if calendario:
         parts.append("calendario registrado")
+    if citas:
+        parts.append("citas registradas")
+    if notificaciones:
+        parts.append("notificaciones registradas")
     if not parts:
         return "sin horario registrado"
     return " y ".join(parts)
@@ -605,6 +724,10 @@ def _compact_user_runtime_payload(item: dict[str, Any], *, include_schedule: boo
     usuario = item.get("usuario") if isinstance(item.get("usuario"), dict) else {}
     horario = item.get("horario")
     calendario = item.get("calendario")
+    citas = item.get("citas")
+    notificaciones = item.get("notificaciones")
+    salones_relacionados = item.get("salones_relacionados") if isinstance(item.get("salones_relacionados"), list) else []
+    salon_principal = item.get("salon_principal") if isinstance(item.get("salon_principal"), dict) else {}
 
     compact = {
         "doc_id": _clean_text(item.get("doc_id")),
@@ -620,10 +743,24 @@ def _compact_user_runtime_payload(item: dict[str, Any], *, include_schedule: boo
             compact["horario"] = _compact_horario_payload(horario, max_items=16)
         if calendario:
             compact["calendario"] = _compact_nested_payload(calendario, max_items=14, max_depth=3)
+        if citas:
+            compact["citas"] = _compact_nested_payload(citas, max_items=12, max_depth=3)
+        if notificaciones:
+            compact["notificaciones"] = _compact_nested_payload(notificaciones, max_items=12, max_depth=3)
     else:
-        compact["resumen_horario"] = _schedule_presence_summary(horario, calendario)
+        compact["resumen_horario"] = _schedule_presence_summary(horario, calendario, citas, notificaciones)
         compact["tiene_horario"] = bool(horario)
         compact["tiene_calendario"] = bool(calendario)
+        compact["tiene_citas"] = bool(citas)
+        compact["tiene_notificaciones"] = bool(notificaciones)
+
+    if salon_principal:
+        compact["salon_principal"] = _compact_nested_payload(salon_principal, max_items=10, max_depth=2)
+    if salones_relacionados:
+        compact["salones_relacionados"] = [
+            _compact_nested_payload(salon, max_items=10, max_depth=2)
+            for salon in salones_relacionados[:3]
+        ]
 
     return {
         key: value
@@ -946,8 +1083,87 @@ class FirestoreAdminClient:
                     queue.append((f"{snapshot.reference.path}/{subcollection.id}", depth + 1))
 
 
+def _is_student_record(record: dict[str, Any]) -> bool:
+    """Detecta registros de alumno/estudiante para excluirlos del contexto del agente."""
+    flat = flatten_data(record)
+    if not flat:
+        return False
+
+    student_markers = {
+        _normalize_text(marker)
+        for marker in _split_csv_env("FIREBASE_EXCLUDED_STUDENT_MARKERS", list(DEFAULT_STUDENT_MARKERS))
+    }
+
+    tipo = _normalize_text(record.get("tipo", ""))
+    rol = _normalize_text(record.get("rol", ""))
+    if any(marker in tipo for marker in student_markers):
+        return True
+    if any(marker in rol for marker in student_markers):
+        return True
+
+    for key, value in flat.items():
+        key_norm = _normalize_text(key)
+        value_norm = _normalize_text(value)
+
+        key_is_user_related = any(
+            token in key_norm
+            for token in ("rol", "role", "tipo", "type", "perfil", "cargo", "puesto", "usuario", "user")
+        )
+        if key_is_user_related and any(marker in value_norm for marker in student_markers):
+            return True
+
+        if any(marker in key_norm for marker in student_markers):
+            if value_norm not in {"", "false", "0", "no", "none", "null"}:
+                return True
+
+    return False
+
+
+def _redact_student_branches(value: Any) -> Any:
+    """Remueve ramas que parezcan datos de alumnos dentro de payloads anidados."""
+    student_markers = {
+        _normalize_text(marker)
+        for marker in _split_csv_env("FIREBASE_EXCLUDED_STUDENT_MARKERS", list(DEFAULT_STUDENT_MARKERS))
+    }
+
+    if isinstance(value, dict):
+        if _is_student_record(value):
+            return {}
+
+        cleaned_dict: dict[str, Any] = {}
+        for key, item in value.items():
+            key_norm = _normalize_text(key)
+            if any(marker in key_norm for marker in student_markers):
+                continue
+
+            cleaned_item = _redact_student_branches(item)
+            if cleaned_item in (None, "", [], {}):
+                continue
+            cleaned_dict[key] = cleaned_item
+
+        return cleaned_dict
+
+    if isinstance(value, list):
+        cleaned_list: list[Any] = []
+        for item in value:
+            if isinstance(item, dict) and _is_student_record(item):
+                continue
+
+            cleaned_item = _redact_student_branches(item)
+            if cleaned_item in (None, "", [], {}):
+                continue
+            cleaned_list.append(cleaned_item)
+
+        return cleaned_list
+
+    return value
+
+
 def _is_professor_record(record: dict[str, Any]) -> bool:
     """Compatibilidad historica: ahora aplica filtro academico + tipo profesor/administrativo."""
+    if _is_student_record(record):
+        return False
+
     field_markers = {
         marker.lower()
         for marker in _split_csv_env("FIREBASE_PROFESSOR_FIELD_MARKERS", list(DEFAULT_PROFESSOR_FIELD_MARKERS))
@@ -1016,12 +1232,246 @@ def _is_professor_record(record: dict[str, Any]) -> bool:
     return has_role and has_type
 
 
+def _merge_documents_for_collections(
+    client: Any,
+    collection_candidates: list[str],
+) -> tuple[dict[str, FirestoreRecord], list[str]]:
+    by_id: dict[str, FirestoreRecord] = {}
+    detected: list[str] = []
+
+    for collection_name in collection_candidates:
+        try:
+            current = client.get_documents_by_id(collection_name)
+        except Exception as exc:
+            log.warning("No se pudo leer la coleccion relacionada '%s': %s", collection_name, exc)
+            continue
+
+        if current:
+            detected.append(collection_name)
+            for doc_id, record in current.items():
+                by_id.setdefault(doc_id, record)
+
+    return by_id, detected
+
+
+def _build_users_collection_config() -> dict[str, Any]:
+    usuarios_collection = _collection_env("FIREBASE_USUARIOS_COLLECTION", "usuarios")
+    configured_horarios = _collection_env("FIREBASE_HORARIOS_COLLECTION", "horarios")
+    configured_calendarios = _collection_env("FIREBASE_CALENDARIOS_COLLECTION", "calendarios")
+    configured_citas = _collection_env("FIREBASE_CITAS_COLLECTION", "citas")
+    configured_notificaciones = _collection_env("FIREBASE_NOTIFICACIONES_COLLECTION", "notificaciones")
+
+    horarios_candidates = _collection_candidates(configured_horarios, ["horarios", "horrios"])
+    calendarios_candidates = _collection_candidates(configured_calendarios, ["calendarios", "calendario"])
+    citas_candidates = _collection_candidates(configured_citas, list(DEFAULT_CITAS_COLLECTION_CANDIDATES))
+    notificaciones_candidates = _collection_candidates(
+        configured_notificaciones,
+        list(DEFAULT_NOTIFICACIONES_COLLECTION_CANDIDATES),
+    )
+
+    return {
+        "usuarios_collection": usuarios_collection,
+        "configured_horarios": configured_horarios,
+        "configured_calendarios": configured_calendarios,
+        "configured_citas": configured_citas,
+        "configured_notificaciones": configured_notificaciones,
+        "horarios_candidates": horarios_candidates,
+        "calendarios_candidates": calendarios_candidates,
+        "citas_candidates": citas_candidates,
+        "notificaciones_candidates": notificaciones_candidates,
+    }
+
+
+def _build_users_collections_bundle(client: Any) -> dict[str, Any]:
+    config = _build_users_collection_config()
+    usuarios_collection = config["usuarios_collection"]
+    horarios_candidates = config["horarios_candidates"]
+    calendarios_candidates = config["calendarios_candidates"]
+    citas_candidates = config["citas_candidates"]
+    notificaciones_candidates = config["notificaciones_candidates"]
+
+    usuarios_by_id = client.get_documents_by_id(usuarios_collection)
+    horarios_by_id, horarios_detectadas = _merge_documents_for_collections(client, horarios_candidates)
+    calendarios_by_id, calendarios_detectadas = _merge_documents_for_collections(client, calendarios_candidates)
+    citas_by_id, citas_detectadas = _merge_documents_for_collections(client, citas_candidates)
+    notificaciones_by_id, notificaciones_detectadas = _merge_documents_for_collections(
+        client,
+        notificaciones_candidates,
+    )
+
+    return {
+        **config,
+        "usuarios_by_id": usuarios_by_id,
+        "horarios_by_id": horarios_by_id,
+        "calendarios_by_id": calendarios_by_id,
+        "citas_by_id": citas_by_id,
+        "notificaciones_by_id": notificaciones_by_id,
+        "horarios_detectadas": horarios_detectadas,
+        "calendarios_detectadas": calendarios_detectadas,
+        "citas_detectadas": citas_detectadas,
+        "notificaciones_detectadas": notificaciones_detectadas,
+    }
+
+
+def _extract_salon_lookup_keys(value: Any) -> set[str]:
+    text = _clean_text(value)
+    if not text:
+        return set()
+
+    keys: set[str] = set()
+    text_key = _normalize_lookup_token(text)
+    if text_key:
+        keys.add(text_key)
+
+    for match in J_CODE_PATTERN.finditer(text):
+        try:
+            keys.add(f"j{int(match.group(1))}")
+        except ValueError:
+            continue
+
+    return keys
+
+
+def _build_salones_lookup_indexes(
+    salones_records: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    by_lookup_key: dict[str, list[dict[str, Any]]] = {}
+    by_responsable: dict[str, list[dict[str, Any]]] = {}
+
+    for item in salones_records:
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+
+        item_keys: set[str] = set()
+        for value in (
+            item.get("doc_id"),
+            data.get("nomenclatura"),
+            data.get("codigo"),
+            data.get("codigoSalon"),
+            data.get("codigo_salon"),
+            data.get("idConjunto"),
+            data.get("nombre"),
+        ):
+            item_keys.update(_extract_salon_lookup_keys(value))
+
+        for key in item_keys:
+            by_lookup_key.setdefault(key, []).append(item)
+
+        for responsable_name in _extract_responsable_names(data.get("responsables"), max_items=16):
+            normalized = _normalize_text(responsable_name)
+            if not normalized:
+                continue
+            by_responsable.setdefault(normalized, []).append(item)
+
+    return by_lookup_key, by_responsable
+
+
+def _collect_user_name_candidates(usuario_data: dict[str, Any]) -> list[str]:
+    return _dedupe_preserve_order(
+        [
+            _clean_text(usuario_data.get("nombre")),
+            _clean_text(usuario_data.get("name")),
+            _clean_text(usuario_data.get("displayName")),
+            _clean_text(usuario_data.get("responsable")),
+        ]
+    )
+
+
+def _names_likely_match(a: str, b: str) -> bool:
+    a_norm = _normalize_text(a)
+    b_norm = _normalize_text(b)
+
+    if not a_norm or not b_norm:
+        return False
+    if a_norm == b_norm:
+        return True
+
+    if len(a_norm) >= 8 and (a_norm in b_norm or b_norm in a_norm):
+        return True
+
+    a_tokens = {token for token in a_norm.split() if len(token) >= 3}
+    b_tokens = {token for token in b_norm.split() if len(token) >= 3}
+    return len(a_tokens.intersection(b_tokens)) >= 2
+
+
+def _resolve_related_salones_for_user(
+    *,
+    doc_id: str,
+    usuario_data: dict[str, Any],
+    horario_data: dict[str, Any] | None,
+    calendario_data: dict[str, Any] | None,
+    citas_data: dict[str, Any] | None,
+    notificaciones_data: dict[str, Any] | None,
+    salones_by_lookup_key: dict[str, list[dict[str, Any]]],
+    salones_by_responsable: dict[str, list[dict[str, Any]]],
+    max_items: int = 3,
+) -> list[dict[str, Any]]:
+    lookup_keys: set[str] = set()
+
+    for record in [usuario_data, horario_data, calendario_data, citas_data, notificaciones_data]:
+        if not isinstance(record, dict):
+            continue
+        flat = flatten_data(record)
+        for key, value in flat.items():
+            value_text = _clean_text(value)
+            if not value_text:
+                continue
+
+            key_norm = _normalize_text(key)
+            value_keys = _extract_salon_lookup_keys(value_text)
+            if not value_keys:
+                continue
+
+            if any(
+                marker in key_norm
+                for marker in ("salon", "aula", "nomenclatura", "codigo", "room", "laboratorio", "ubicacion")
+            ):
+                lookup_keys.update(value_keys)
+            else:
+                lookup_keys.update({candidate for candidate in value_keys if candidate.startswith("j")})
+
+    lookup_keys.update(_extract_salon_lookup_keys(doc_id))
+
+    related: list[dict[str, Any]] = []
+    seen_doc_ids: set[str] = set()
+
+    def _append_candidate(item: dict[str, Any]) -> None:
+        salon_doc_id = _clean_text(item.get("doc_id"))
+        if salon_doc_id and salon_doc_id in seen_doc_ids:
+            return
+        if salon_doc_id:
+            seen_doc_ids.add(salon_doc_id)
+        related.append(item)
+
+    for key in lookup_keys:
+        for item in salones_by_lookup_key.get(key, []):
+            _append_candidate(item)
+            if len(related) >= max_items:
+                return related
+
+    user_names = _collect_user_name_candidates(usuario_data)
+    for user_name in user_names:
+        user_norm = _normalize_text(user_name)
+        if not user_norm:
+            continue
+
+        for responsable_name, items in salones_by_responsable.items():
+            if not _names_likely_match(user_norm, responsable_name):
+                continue
+            for item in items:
+                _append_candidate(item)
+                if len(related) >= max_items:
+                    return related
+
+    return related
+
+
 def _build_client_from_env(
     project_var: str,
     api_key_var: str,
     *,
     service_account_file_var: str | None = None,
     service_account_json_var: str | None = None,
+    fallback_service_account_files: list[str] | None = None,
     admin_app_name: str | None = None,
 ) -> FirestoreRESTClient | FirestoreAdminClient | None:
     project_id = os.getenv(project_var, "").strip()
@@ -1030,6 +1480,7 @@ def _build_client_from_env(
     service_account, source = _service_account_from_env(
         file_var=service_account_file_var,
         json_var=service_account_json_var,
+        fallback_file_names=fallback_service_account_files,
     )
     if service_account:
         effective_project_id = project_id or str(service_account.get("project_id") or "").strip()
@@ -1071,6 +1522,7 @@ def fetch_salones_documents() -> list[Document]:
         "VITE_FIREBASE_SALONES_API_KEY",
         service_account_file_var="FIREBASE_SALONES_SERVICE_ACCOUNT_FILE",
         service_account_json_var="FIREBASE_SALONES_SERVICE_ACCOUNT_JSON",
+        fallback_service_account_files=[DEFAULT_LOCAL_SALONES_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_salones",
     )
     if client is None:
@@ -1082,6 +1534,8 @@ def fetch_salones_documents() -> list[Document]:
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
         "FIREBASE_SALONES_COLLECTIONS",
     )
+    if not collection_allowlist:
+        collection_allowlist = list(DEFAULT_SALONES_COLLECTION_ALLOWLIST)
 
     documents: list[Document] = []
 
@@ -1104,72 +1558,93 @@ def fetch_salones_documents() -> list[Document]:
 def fetch_profesores_documents() -> list[Document]:
     """
     Extrae usuarios academicos cuyo tipo sea profesor/administrativo
-    y relaciona horario + calendario por ID de documento.
+    y relaciona horario + calendario + citas + notificaciones por ID de documento,
+    ademas de salones donde opera.
     """
     client = _build_client_from_env(
         "VITE_FIREBASE_PROJECT_ID",
         "VITE_FIREBASE_API_KEY",
         service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
         service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        fallback_service_account_files=[DEFAULT_LOCAL_USERS_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_users",
     )
     if client is None:
         return []
 
-    usuarios_collection = _collection_env("FIREBASE_USUARIOS_COLLECTION", "usuarios")
-    configured_horarios = _collection_env("FIREBASE_HORARIOS_COLLECTION", "horarios")
-    configured_calendarios = _collection_env("FIREBASE_CALENDARIOS_COLLECTION", "calendarios")
-    horarios_candidates = [configured_horarios]
-    if "horarios" not in horarios_candidates:
-        horarios_candidates.append("horarios")
-    if "horrios" not in horarios_candidates:
-        horarios_candidates.append("horrios")
+    bundle = _build_users_collections_bundle(client)
+    usuarios_collection = bundle["usuarios_collection"]
+    usuarios_by_id = bundle["usuarios_by_id"]
 
-    calendarios_candidates = [configured_calendarios]
-    if "calendarios" not in calendarios_candidates:
-        calendarios_candidates.append("calendarios")
-    if "calendario" not in calendarios_candidates:
-        calendarios_candidates.append("calendario")
+    horarios_by_id = bundle["horarios_by_id"]
+    calendarios_by_id = bundle["calendarios_by_id"]
+    citas_by_id = bundle["citas_by_id"]
+    notificaciones_by_id = bundle["notificaciones_by_id"]
 
-    usuarios_by_id = client.get_documents_by_id(usuarios_collection)
+    try:
+        salones_records = fetch_salones_raw_records()
+    except Exception as exc:
+        salones_records = []
+        log.warning("No fue posible cargar salones para relacionar personal: %s", exc)
 
-    horarios_by_id: dict[str, FirestoreRecord] = {}
-    horarios_detectadas: list[str] = []
-    for horarios_collection in horarios_candidates:
-        current = client.get_documents_by_id(horarios_collection)
-        if current:
-            horarios_detectadas.append(horarios_collection)
-            for doc_id, horario_record in current.items():
-                horarios_by_id.setdefault(doc_id, horario_record)
-
-    calendarios_by_id: dict[str, FirestoreRecord] = {}
-    calendarios_detectadas: list[str] = []
-    for calendarios_collection in calendarios_candidates:
-        current = client.get_documents_by_id(calendarios_collection)
-        if current:
-            calendarios_detectadas.append(calendarios_collection)
-            for doc_id, calendario_record in current.items():
-                calendarios_by_id.setdefault(doc_id, calendario_record)
+    salones_by_lookup_key, salones_by_responsable = _build_salones_lookup_indexes(salones_records)
 
     documentos_profesores: list[Document] = []
     profesores_con_horario = 0
     profesores_con_calendario = 0
+    profesores_con_citas = 0
+    profesores_con_notificaciones = 0
+    profesores_con_salon = 0
 
     for doc_id, usuario_record in usuarios_by_id.items():
         if not _is_professor_record(usuario_record.data):
             continue
 
         horario_record = horarios_by_id.get(doc_id)
-        if horario_record:
+        horario_data = _redact_student_branches(horario_record.data) if horario_record else None
+        if horario_data:
             profesores_con_horario += 1
 
         calendario_record = calendarios_by_id.get(doc_id)
-        if calendario_record:
+        calendario_data = _redact_student_branches(calendario_record.data) if calendario_record else None
+        if calendario_data:
             profesores_con_calendario += 1
 
+        citas_record = citas_by_id.get(doc_id)
+        citas_data = _redact_student_branches(citas_record.data) if citas_record else None
+        if citas_data:
+            profesores_con_citas += 1
+
+        notificaciones_record = notificaciones_by_id.get(doc_id)
+        notificaciones_data = _redact_student_branches(notificaciones_record.data) if notificaciones_record else None
+        if notificaciones_data:
+            profesores_con_notificaciones += 1
+
+        salones_relacionados_raw = _resolve_related_salones_for_user(
+            doc_id=doc_id,
+            usuario_data=usuario_record.data,
+            horario_data=horario_data if isinstance(horario_data, dict) else None,
+            calendario_data=calendario_data if isinstance(calendario_data, dict) else None,
+            citas_data=citas_data if isinstance(citas_data, dict) else None,
+            notificaciones_data=notificaciones_data if isinstance(notificaciones_data, dict) else None,
+            salones_by_lookup_key=salones_by_lookup_key,
+            salones_by_responsable=salones_by_responsable,
+            max_items=3,
+        )
+        salones_relacionados = [
+            _compact_salon_runtime_payload(item, include_schedule=False)
+            for item in salones_relacionados_raw
+        ]
+        if salones_relacionados:
+            profesores_con_salon += 1
+
         record_data = dict(usuario_record.data)
-        record_data["horario"] = horario_record.data if horario_record else None
-        record_data["calendario"] = calendario_record.data if calendario_record else None
+        record_data["horario"] = horario_data
+        record_data["calendario"] = calendario_data
+        record_data["citas"] = citas_data
+        record_data["notificaciones"] = notificaciones_data
+        record_data["salones_relacionados"] = salones_relacionados or None
+        record_data["salon_principal"] = salones_relacionados[0] if salones_relacionados else None
 
         metadata = {
             **usuario_record.metadata,
@@ -1177,19 +1652,27 @@ def fetch_profesores_documents() -> list[Document]:
             "categoria": "idit_personal",
             "es_usuario_academico_objetivo": True,
             "firebase_collection": usuarios_collection,
-            "firebase_related_collection": ",".join(horarios_detectadas) if horarios_detectadas else configured_horarios,
+            "firebase_related_collection": ",".join(bundle["horarios_detectadas"]) if bundle["horarios_detectadas"] else bundle["configured_horarios"],
             "firebase_related_doc_id": doc_id,
-            "horario_encontrado": bool(horario_record),
-            "firebase_calendar_collection": ",".join(calendarios_detectadas) if calendarios_detectadas else configured_calendarios,
-            "calendario_encontrado": bool(calendario_record),
+            "horario_encontrado": bool(horario_data),
+            "firebase_calendar_collection": ",".join(bundle["calendarios_detectadas"]) if bundle["calendarios_detectadas"] else bundle["configured_calendarios"],
+            "calendario_encontrado": bool(calendario_data),
+            "firebase_citas_collection": ",".join(bundle["citas_detectadas"]) if bundle["citas_detectadas"] else bundle["configured_citas"],
+            "citas_encontradas": bool(citas_data),
+            "firebase_notificaciones_collection": ",".join(bundle["notificaciones_detectadas"]) if bundle["notificaciones_detectadas"] else bundle["configured_notificaciones"],
+            "notificaciones_encontradas": bool(notificaciones_data),
+            "salones_relacionados_total": len(salones_relacionados),
         }
         documentos_profesores.append(firestore_record_to_document(record=record_data, metadata=metadata))
 
     log.info(
-        "Firestore usuarios objetivo: usuarios=%s | con_horario=%s | con_calendario=%s | docs_markdown=%s",
+        "Firestore usuarios objetivo: usuarios=%s | con_horario=%s | con_calendario=%s | con_citas=%s | con_notificaciones=%s | con_salon=%s | docs_markdown=%s",
         len(documentos_profesores),
         profesores_con_horario,
         profesores_con_calendario,
+        profesores_con_citas,
+        profesores_con_notificaciones,
+        profesores_con_salon,
         len(documentos_profesores),
     )
     return documentos_profesores
@@ -1223,6 +1706,7 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
         "VITE_FIREBASE_SALONES_API_KEY",
         service_account_file_var="FIREBASE_SALONES_SERVICE_ACCOUNT_FILE",
         service_account_json_var="FIREBASE_SALONES_SERVICE_ACCOUNT_JSON",
+        fallback_service_account_files=[DEFAULT_LOCAL_SALONES_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_salones",
     )
     if client is None:
@@ -1234,6 +1718,8 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
         "FIREBASE_SALONES_COLLECTIONS",
     )
+    if not collection_allowlist:
+        collection_allowlist = list(DEFAULT_SALONES_COLLECTION_ALLOWLIST)
 
     salones: list[dict[str, Any]] = []
     for record in client.iter_documents(
@@ -1246,47 +1732,38 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
     return salones
 
 
-def fetch_target_users_raw_records() -> list[dict[str, Any]]:
-    """Obtiene usuarios academicos objetivo y vincula horarios/calendarios por doc_id."""
+def fetch_target_users_raw_records(
+    *,
+    salones_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Obtiene usuarios academicos objetivo y vincula sus datos operativos por doc_id."""
     client = _build_client_from_env(
         "VITE_FIREBASE_PROJECT_ID",
         "VITE_FIREBASE_API_KEY",
         service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
         service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        fallback_service_account_files=[DEFAULT_LOCAL_USERS_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_users",
     )
     if client is None:
         return []
 
-    usuarios_collection = _collection_env("FIREBASE_USUARIOS_COLLECTION", "usuarios")
-    configured_horarios = _collection_env("FIREBASE_HORARIOS_COLLECTION", "horarios")
-    configured_calendarios = _collection_env("FIREBASE_CALENDARIOS_COLLECTION", "calendarios")
+    bundle = _build_users_collections_bundle(client)
+    usuarios_collection = bundle["usuarios_collection"]
+    usuarios_by_id = bundle["usuarios_by_id"]
+    horarios_by_id = bundle["horarios_by_id"]
+    calendarios_by_id = bundle["calendarios_by_id"]
+    citas_by_id = bundle["citas_by_id"]
+    notificaciones_by_id = bundle["notificaciones_by_id"]
 
-    horarios_candidates = [configured_horarios]
-    if "horarios" not in horarios_candidates:
-        horarios_candidates.append("horarios")
-    if "horrios" not in horarios_candidates:
-        horarios_candidates.append("horrios")
+    if salones_records is None:
+        try:
+            salones_records = fetch_salones_raw_records()
+        except Exception as exc:
+            salones_records = []
+            log.warning("No fue posible cargar salones para relacionar usuarios objetivo: %s", exc)
 
-    calendarios_candidates = [configured_calendarios]
-    if "calendarios" not in calendarios_candidates:
-        calendarios_candidates.append("calendarios")
-    if "calendario" not in calendarios_candidates:
-        calendarios_candidates.append("calendario")
-
-    usuarios_by_id = client.get_documents_by_id(usuarios_collection)
-
-    horarios_by_id: dict[str, FirestoreRecord] = {}
-    for horarios_collection in horarios_candidates:
-        current = client.get_documents_by_id(horarios_collection)
-        for doc_id, horario_record in current.items():
-            horarios_by_id.setdefault(doc_id, horario_record)
-
-    calendarios_by_id: dict[str, FirestoreRecord] = {}
-    for calendarios_collection in calendarios_candidates:
-        current = client.get_documents_by_id(calendarios_collection)
-        for doc_id, calendario_record in current.items():
-            calendarios_by_id.setdefault(doc_id, calendario_record)
+    salones_by_lookup_key, salones_by_responsable = _build_salones_lookup_indexes(salones_records)
 
     payloads: list[dict[str, Any]] = []
     for doc_id, usuario_record in usuarios_by_id.items():
@@ -1295,6 +1772,29 @@ def fetch_target_users_raw_records() -> list[dict[str, Any]]:
 
         horario_record = horarios_by_id.get(doc_id)
         calendario_record = calendarios_by_id.get(doc_id)
+        citas_record = citas_by_id.get(doc_id)
+        notificaciones_record = notificaciones_by_id.get(doc_id)
+
+        horario_data = _redact_student_branches(horario_record.data) if horario_record else None
+        calendario_data = _redact_student_branches(calendario_record.data) if calendario_record else None
+        citas_data = _redact_student_branches(citas_record.data) if citas_record else None
+        notificaciones_data = _redact_student_branches(notificaciones_record.data) if notificaciones_record else None
+
+        salones_relacionados_raw = _resolve_related_salones_for_user(
+            doc_id=doc_id,
+            usuario_data=usuario_record.data,
+            horario_data=horario_data if isinstance(horario_data, dict) else None,
+            calendario_data=calendario_data if isinstance(calendario_data, dict) else None,
+            citas_data=citas_data if isinstance(citas_data, dict) else None,
+            notificaciones_data=notificaciones_data if isinstance(notificaciones_data, dict) else None,
+            salones_by_lookup_key=salones_by_lookup_key,
+            salones_by_responsable=salones_by_responsable,
+            max_items=3,
+        )
+        salones_relacionados = [
+            _compact_salon_runtime_payload(item, include_schedule=False)
+            for item in salones_relacionados_raw
+        ]
 
         payloads.append(
             {
@@ -1303,27 +1803,57 @@ def fetch_target_users_raw_records() -> list[dict[str, Any]]:
                 "collection": usuarios_collection,
                 "doc_id": doc_id,
                 "usuario": usuario_record.data,
-                "horario": horario_record.data if horario_record else None,
-                "calendario": calendario_record.data if calendario_record else None,
+                "horario": horario_data,
+                "calendario": calendario_data,
+                "citas": citas_data,
+                "notificaciones": notificaciones_data,
+                "salones_relacionados": salones_relacionados,
+                "salon_principal": salones_relacionados[0] if salones_relacionados else None,
                 "horario_collection": horario_record.metadata.get("firebase_collection") if horario_record else None,
                 "calendario_collection": calendario_record.metadata.get("firebase_collection") if calendario_record else None,
+                "citas_collection": citas_record.metadata.get("firebase_collection") if citas_record else None,
+                "notificaciones_collection": notificaciones_record.metadata.get("firebase_collection") if notificaciones_record else None,
             }
         )
 
     return payloads
 
 
-def fetch_users_all_raw_records() -> list[dict[str, Any]]:
+def fetch_users_all_raw_records(*, target_user_ids: set[str] | None = None) -> list[dict[str, Any]]:
     """Obtiene toda la informacion del proyecto de usuarios en formato crudo."""
     client = _build_client_from_env(
         "VITE_FIREBASE_PROJECT_ID",
         "VITE_FIREBASE_API_KEY",
         service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
         service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        fallback_service_account_files=[DEFAULT_LOCAL_USERS_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_users",
     )
     if client is None:
         return []
+
+    config = _build_users_collection_config()
+    if target_user_ids is None:
+        usuarios_by_id = client.get_documents_by_id(config["usuarios_collection"])
+        target_user_ids = {
+            _clean_text(doc_id)
+            for doc_id, usuario_record in usuarios_by_id.items()
+            if _is_professor_record(usuario_record.data)
+        }
+    else:
+        target_user_ids = {_clean_text(doc_id) for doc_id in target_user_ids if _clean_text(doc_id)}
+
+    if not target_user_ids:
+        return []
+
+    related_leaf_collections = {
+        _collection_leaf_name(config["usuarios_collection"]),
+        *(_collection_leaf_name(name) for name in config["horarios_candidates"]),
+        *(_collection_leaf_name(name) for name in config["calendarios_candidates"]),
+        *(_collection_leaf_name(name) for name in config["citas_candidates"]),
+        *(_collection_leaf_name(name) for name in config["notificaciones_candidates"]),
+    }
+    related_leaf_collections = {name for name in related_leaf_collections if name}
 
     include_subcollections = _bool_env("FIREBASE_USERS_INCLUDE_SUBCOLLECTIONS", True)
     max_depth = _optional_int_env("FIREBASE_USERS_MAX_TRAVERSAL_DEPTH", None)
@@ -1331,6 +1861,8 @@ def fetch_users_all_raw_records() -> list[dict[str, Any]]:
         "FIREBASE_USERS_COLLECTION_ALLOWLIST",
         "FIREBASE_USERS_COLLECTIONS",
     )
+    if not collection_allowlist:
+        collection_allowlist = list(DEFAULT_USERS_COLLECTION_ALLOWLIST)
 
     records: list[dict[str, Any]] = []
     for record in client.iter_documents(
@@ -1338,7 +1870,21 @@ def fetch_users_all_raw_records() -> list[dict[str, Any]]:
         include_subcollections=include_subcollections,
         max_depth=max_depth,
     ):
-        records.append(_record_payload(record, "firebase_users_all"))
+        payload = _record_payload(record, "firebase_users_all")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        doc_id = _clean_text(payload.get("doc_id"))
+        collection_leaf = _collection_leaf_name(payload.get("collection"))
+
+        if _is_student_record(data):
+            continue
+
+        if collection_leaf in related_leaf_collections and doc_id not in target_user_ids:
+            continue
+
+        if collection_leaf == _collection_leaf_name(config["usuarios_collection"]) and not _is_professor_record(data):
+            continue
+
+        records.append(payload)
 
     return records
 
@@ -1443,13 +1989,19 @@ def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, An
         log.warning("No fue posible cargar salones en vivo: %s", exc)
 
     try:
-        usuarios = fetch_target_users_raw_records()
+        usuarios = fetch_target_users_raw_records(salones_records=salones)
     except Exception as exc:
         errors.append(f"usuarios: {exc}")
         log.warning("No fue posible cargar usuarios en vivo: %s", exc)
 
+    target_user_ids = {
+        _clean_text(item.get("doc_id"))
+        for item in usuarios
+        if isinstance(item, dict) and _clean_text(item.get("doc_id"))
+    }
+
     try:
-        usuarios_all = fetch_users_all_raw_records()
+        usuarios_all = fetch_users_all_raw_records(target_user_ids=target_user_ids)
     except Exception as exc:
         errors.append(f"usuarios_all: {exc}")
         log.warning("No fue posible cargar colecciones completas de usuarios en vivo: %s", exc)
@@ -1810,7 +2362,9 @@ def build_firebase_runtime_context(
     frontend_context: str | None = None,
 ) -> dict[str, Any]:
     """Construye contexto Firebase en vivo (sin Markdown) relevante para la pregunta."""
+    schedule_requested = _question_requests_schedule(question)
     schedule_details_requested = _question_requests_detailed_schedule(question)
+    include_schedule_in_context = schedule_requested
     front_payload = _parse_frontend_context(frontend_context)
 
     try:
@@ -1821,6 +2375,7 @@ def build_firebase_runtime_context(
             "context_text": "",
             "totals": {"salones": 0, "usuarios_objetivo": 0, "usuarios_all": 0},
             "error": str(exc),
+            "schedule_requested": schedule_requested,
             "schedule_details_requested": schedule_details_requested,
         }
 
@@ -1869,17 +2424,24 @@ def build_firebase_runtime_context(
         ]
 
     compact_salones = [
-        _compact_salon_runtime_payload(item, include_schedule=schedule_details_requested)
+        _compact_salon_runtime_payload(item, include_schedule=include_schedule_in_context)
         for item in selected_salones
     ]
     compact_usuarios = [
-        _compact_user_runtime_payload(item, include_schedule=schedule_details_requested)
+        _compact_user_runtime_payload(item, include_schedule=include_schedule_in_context)
         for item in selected_usuarios
     ]
     compact_usuarios_all = [
-        _compact_generic_runtime_payload(item, include_schedule=schedule_details_requested)
+        _compact_generic_runtime_payload(item, include_schedule=include_schedule_in_context)
         for item in selected_usuarios_all
     ]
+
+    front_route_db_cross = _build_frontend_route_db_cross_context(
+        front_payload,
+        salones_all,
+        include_schedule=include_schedule_in_context,
+    )
+    front_route_db_cross_json = _serialize_object_with_char_budget(front_route_db_cross, max_chars=1600)
 
     salones_json, salones_included, salones_total_selected = _serialize_items_with_char_budget(
         compact_salones,
@@ -1899,6 +2461,8 @@ def build_firebase_runtime_context(
         f"totales.salones={snapshot.get('totals', {}).get('salones', 0)}\n"
         f"totales.usuarios_objetivo={snapshot.get('totals', {}).get('usuarios_objetivo', 0)}\n"
         f"totales.usuarios_all={snapshot.get('totals', {}).get('usuarios_all', 0)}\n"
+        "politica.excluir_usuarios_alumno=true\n"
+        f"solicitud_horario={str(schedule_requested).lower()}\n"
         f"solicitud_horario_detallado={str(schedule_details_requested).lower()}\n"
         f"salones_relevantes_incluidos={salones_included}/{salones_total_selected}\n"
         f"usuarios_relevantes_incluidos={usuarios_included}/{usuarios_total_selected}\n"
@@ -1907,6 +2471,8 @@ def build_firebase_runtime_context(
         f"{salones_json}\n"
         "usuarios_relevantes_json=\n"
         f"{usuarios_json}\n"
+        "cruce_front_mapa_salones_json=\n"
+        f"{front_route_db_cross_json}\n"
         "usuarios_all_relevantes_json=\n"
         f"{usuarios_all_json}"
     )
@@ -1915,5 +2481,6 @@ def build_firebase_runtime_context(
         "context_text": context_text,
         "totals": snapshot.get("totals", {"salones": 0, "usuarios_objetivo": 0, "usuarios_all": 0}),
         "error": error_text,
+        "schedule_requested": schedule_requested,
         "schedule_details_requested": schedule_details_requested,
     }

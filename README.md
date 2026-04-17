@@ -69,6 +69,8 @@ VITE_FIREBASE_SALONES_PROJECT_ID=...      # salones IDIT
 FIREBASE_USUARIOS_COLLECTION=usuarios
 FIREBASE_HORARIOS_COLLECTION=horarios
 FIREBASE_CALENDARIOS_COLLECTION=calendarios
+FIREBASE_CITAS_COLLECTION=citas
+FIREBASE_NOTIFICACIONES_COLLECTION=notificaciones
 FIREBASE_INCLUDE_SUBCOLLECTIONS=true
 FIREBASE_MAX_TRAVERSAL_DEPTH=2
 FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH=none
@@ -77,12 +79,13 @@ FIREBASE_USERS_MAX_TRAVERSAL_DEPTH=none
 
 # Si REST no permite descubrir colecciones raiz, define allowlists:
 FIREBASE_SALONES_COLLECTION_ALLOWLIST=salones
-FIREBASE_USERS_COLLECTION_ALLOWLIST=usuarios,horarios,calendarios
+FIREBASE_USERS_COLLECTION_ALLOWLIST=usuarios,horarios,calendarios,citas,notificaciones
 
 FIREBASE_PROFESSOR_FIELD_MARKERS=rol,role,tipo_usuario,teacher,is_professor
 FIREBASE_PROFESSOR_VALUE_MARKERS=profesor,docente,teacher,faculty
 FIREBASE_TARGET_ROLES=academico,académico
 FIREBASE_TARGET_TYPES=profesor,administrativo,aminisrativo
+FIREBASE_EXCLUDED_STUDENT_MARKERS=alumno,alumna,estudiante,student
 FIREBASE_RUNTIME_CACHE_TTL_SECONDS=45
 ```
 
@@ -103,6 +106,10 @@ FIREBASE_USERS_SERVICE_ACCOUNT_FILE=C:/ruta/sa-usuarios.json
 # O equivalente embebido:
 # FIREBASE_USERS_SERVICE_ACCOUNT_JSON={...json...}
 # FIREBASE_USERS_SERVICE_ACCOUNT_JSON_BASE64=...
+
+# Defaults locales en este repo (si no defines variables anteriores):
+# - siis-d3571-336618a9b5d1.json (salones)
+# - siis-9593c-611399213026.json (usuarios)
 ```
 
 Tambien se acepta fallback global:
@@ -117,9 +124,10 @@ Nota: la fuente de salones se recorre completa por defecto (todas las coleccione
 
 Nota: en runtime, el agente consulta Firebase en vivo para:
 - Salones: toda la informacion disponible.
-- Usuarios: `rol=academico` y `tipo` profesor/administrativo (incluye variantes tipograficas).
-- Usuarios (full): muestra tambien registros relevantes de cualquier coleccion/subcoleccion para responder preguntas fuera del subset objetivo.
-- Join por `doc_id` con colecciones de horarios y calendarios.
+- Usuarios: `rol=academico` y `tipo` profesor/administrativo (incluye variantes tipograficas) y excluye alumnos/estudiantes.
+- Usuarios (full): limita registros a IDs de usuarios objetivo para colecciones `usuarios`, `horarios`, `calendarios`, `citas` y `notificaciones`.
+- Join por `doc_id` con colecciones de horarios, calendarios, citas y notificaciones.
+- Cruza personal academico con salones (por claves de salon y responsables) para responder en que salon operan.
 
 ## Formato Markdown unificado
 
