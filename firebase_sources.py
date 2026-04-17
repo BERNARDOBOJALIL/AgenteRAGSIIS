@@ -6,17 +6,28 @@ Extraccion de datos desde Firestore via REST para alimentar el agente RAG.
 from __future__ import annotations
 
 import json
+import base64
 import logging
 import os
 import re
 import time
 import unicodedata
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 import requests
 from dotenv import load_dotenv
 from langchain_core.documents import Document
+
+try:
+    import firebase_admin  # type: ignore[import-not-found]
+    from firebase_admin import credentials as firebase_credentials  # type: ignore[import-not-found]
+    from firebase_admin import firestore as firebase_firestore  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - depende de entorno
+    firebase_admin = None
+    firebase_credentials = None
+    firebase_firestore = None
 
 from markdown_unifier import flatten_data, firestore_record_to_document
 
@@ -191,6 +202,69 @@ def _collection_allowlist_env(*names: str) -> list[str] | None:
         if values:
             return values
     return None
+
+
+def _datetime_to_iso(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)
+
+
+def _service_account_from_env(
+    *,
+    file_var: str | None,
+    json_var: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Carga service account desde archivo o JSON/base64 en variables de entorno."""
+    candidates: list[tuple[str | None, str]] = []
+    if file_var:
+        candidates.append((os.getenv(file_var, "").strip(), f"env:{file_var}"))
+    candidates.append((os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(), "env:GOOGLE_APPLICATION_CREDENTIALS"))
+
+    for path, source in candidates:
+        if not path:
+            continue
+        if not os.path.exists(path):
+            log.warning("Ruta de credencial no existe (%s): %s", source, path)
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                return payload, source
+        except Exception as exc:
+            log.warning("No se pudo leer credencial JSON (%s): %s", source, exc)
+
+    json_candidates: list[tuple[str | None, str]] = []
+    if json_var:
+        json_candidates.append((os.getenv(json_var, "").strip(), f"env:{json_var}"))
+        json_candidates.append((os.getenv(f"{json_var}_BASE64", "").strip(), f"env:{json_var}_BASE64"))
+    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON"))
+    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON_BASE64", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON_BASE64"))
+
+    for raw, source in json_candidates:
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload, source
+        except Exception:
+            pass
+
+        try:
+            decoded = base64.b64decode(raw).decode("utf-8")
+            payload = json.loads(decoded)
+            if isinstance(payload, dict):
+                return payload, source
+        except Exception as exc:
+            log.warning("No se pudo parsear service account desde %s: %s", source, exc)
+
+    return None, ""
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -665,7 +739,7 @@ class FirestoreRESTClient:
             except Exception as exc:
                 raise RuntimeError(
                     "No se pudieron listar colecciones raiz en Firestore REST. "
-                    "Define FIREBASE_SALONES_COLLECTION_ALLOWLIST con los nombres de coleccion "
+                    "Define una variable *_COLLECTION_ALLOWLIST con los nombres de coleccion "
                     "o usa credenciales administrativas para descubrimiento completo."
                 ) from exc
         queue: list[tuple[str, int]] = [(collection_path, 0) for collection_path in root_collections]
@@ -758,6 +832,120 @@ class FirestoreRESTClient:
         return value
 
 
+class FirestoreAdminClient:
+    """Cliente Firestore via Firebase Admin SDK (lectura administrativa)."""
+
+    def __init__(self, *, project_id: str, service_account: dict[str, Any], app_name: str):
+        if firebase_admin is None or firebase_credentials is None or firebase_firestore is None:
+            raise RuntimeError("El paquete firebase-admin no esta disponible. Instala 'firebase-admin'.")
+
+        self.project_id = project_id
+        self.app_name = app_name
+
+        existing_apps = getattr(firebase_admin, "_apps", {})
+        if app_name in existing_apps:
+            app = firebase_admin.get_app(app_name)
+        else:
+            cred = firebase_credentials.Certificate(service_account)
+            app = firebase_admin.initialize_app(cred, options={"projectId": project_id}, name=app_name)
+
+        self._db = firebase_firestore.client(app=app)
+
+    def _doc_name(self, doc_path: str) -> str:
+        return f"projects/{self.project_id}/databases/(default)/documents/{doc_path}"
+
+    def _to_record_from_snapshot(self, snapshot: Any, collection_path: str) -> FirestoreRecord:
+        data = snapshot.to_dict() or {}
+        doc_path = snapshot.reference.path
+        metadata = {
+            "firebase_project": self.project_id,
+            "firebase_collection": collection_path,
+            "firebase_doc_id": snapshot.id,
+            "firebase_document_name": self._doc_name(doc_path),
+            "firebase_create_time": _datetime_to_iso(getattr(snapshot, "create_time", "")),
+            "firebase_update_time": _datetime_to_iso(getattr(snapshot, "update_time", "")),
+        }
+        return FirestoreRecord(data=data, metadata=metadata)
+
+    def _normalize_parent_doc_path(self, parent_document: str) -> str:
+        if "/documents/" in parent_document:
+            return parent_document.split("/documents/", 1)[1]
+        return parent_document
+
+    def list_collection_ids(self, parent_document: str | None = None) -> list[str]:
+        if parent_document:
+            relative = self._normalize_parent_doc_path(parent_document)
+            doc_ref = self._db.document(relative)
+            return [collection.id for collection in doc_ref.collections()]
+
+        return [collection.id for collection in self._db.collections()]
+
+    def list_collection_documents(self, collection_path: str) -> list[dict[str, Any]]:
+        docs: list[dict[str, Any]] = []
+        for snapshot in self._db.collection(collection_path).stream():
+            docs.append(
+                {
+                    "id": snapshot.id,
+                    "name": self._doc_name(snapshot.reference.path),
+                    "data": snapshot.to_dict() or {},
+                    "createTime": _datetime_to_iso(getattr(snapshot, "create_time", "")),
+                    "updateTime": _datetime_to_iso(getattr(snapshot, "update_time", "")),
+                }
+            )
+        return docs
+
+    def get_documents_by_id(self, collection_path: str) -> dict[str, FirestoreRecord]:
+        by_id: dict[str, FirestoreRecord] = {}
+        for snapshot in self._db.collection(collection_path).stream():
+            record = self._to_record_from_snapshot(snapshot, collection_path)
+            by_id[record.metadata.get("firebase_doc_id", "sin_id")] = record
+        return by_id
+
+    def iter_documents(
+        self,
+        *,
+        collection_allowlist: list[str] | None = None,
+        include_subcollections: bool = True,
+        max_depth: int | None = DEFAULT_MAX_DEPTH,
+    ) -> Iterator[FirestoreRecord]:
+        root_collections = collection_allowlist or self.list_collection_ids()
+        queue: list[tuple[str, int]] = [(collection_path, 0) for collection_path in root_collections]
+        visited_paths: set[str] = set()
+
+        while queue:
+            collection_path, depth = queue.pop(0)
+            if collection_path in visited_paths:
+                continue
+            visited_paths.add(collection_path)
+
+            try:
+                snapshots = list(self._db.collection(collection_path).stream())
+            except Exception as exc:
+                log.warning("No se pudo leer la coleccion '%s' (admin): %s", collection_path, exc)
+                continue
+
+            for snapshot in snapshots:
+                record = self._to_record_from_snapshot(snapshot, collection_path)
+                yield record
+
+                can_descend = max_depth is None or depth < max_depth
+                if not include_subcollections or not can_descend:
+                    continue
+
+                try:
+                    subcollections = list(snapshot.reference.collections())
+                except Exception as exc:
+                    log.warning(
+                        "No se pudieron listar subcolecciones (admin) para '%s': %s",
+                        snapshot.reference.path,
+                        exc,
+                    )
+                    continue
+
+                for subcollection in subcollections:
+                    queue.append((f"{snapshot.reference.path}/{subcollection.id}", depth + 1))
+
+
 def _is_professor_record(record: dict[str, Any]) -> bool:
     """Compatibilidad historica: ahora aplica filtro academico + tipo profesor/administrativo."""
     field_markers = {
@@ -828,9 +1016,38 @@ def _is_professor_record(record: dict[str, Any]) -> bool:
     return has_role and has_type
 
 
-def _build_client_from_env(project_var: str, api_key_var: str) -> FirestoreRESTClient | None:
+def _build_client_from_env(
+    project_var: str,
+    api_key_var: str,
+    *,
+    service_account_file_var: str | None = None,
+    service_account_json_var: str | None = None,
+    admin_app_name: str | None = None,
+) -> FirestoreRESTClient | FirestoreAdminClient | None:
     project_id = os.getenv(project_var, "").strip()
     api_key = os.getenv(api_key_var, "").strip()
+
+    service_account, source = _service_account_from_env(
+        file_var=service_account_file_var,
+        json_var=service_account_json_var,
+    )
+    if service_account:
+        effective_project_id = project_id or str(service_account.get("project_id") or "").strip()
+        if not effective_project_id:
+            log.warning(
+                "No fue posible resolver project_id para cliente admin en %s. Revisa %s y credencial.",
+                project_var,
+                source,
+            )
+        else:
+            try:
+                return FirestoreAdminClient(
+                    project_id=effective_project_id,
+                    service_account=service_account,
+                    app_name=admin_app_name or f"admin_{effective_project_id}",
+                )
+            except Exception as exc:
+                log.warning("No se pudo inicializar cliente Firestore Admin (%s): %s", source, exc)
 
     if not project_id or not api_key:
         log.warning("Faltan variables %s o %s. Se omite esta fuente Firestore.", project_var, api_key_var)
@@ -849,11 +1066,17 @@ def fetch_salones_documents() -> list[Document]:
     Extrae informacion de la base Firestore de salones IDIT.
     Por defecto recorre documentos de colecciones raiz (sin subcolecciones).
     """
-    client = _build_client_from_env("VITE_FIREBASE_SALONES_PROJECT_ID", "VITE_FIREBASE_SALONES_API_KEY")
+    client = _build_client_from_env(
+        "VITE_FIREBASE_SALONES_PROJECT_ID",
+        "VITE_FIREBASE_SALONES_API_KEY",
+        service_account_file_var="FIREBASE_SALONES_SERVICE_ACCOUNT_FILE",
+        service_account_json_var="FIREBASE_SALONES_SERVICE_ACCOUNT_JSON",
+        admin_app_name="firebase_admin_salones",
+    )
     if client is None:
         return []
 
-    include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", False)
+    include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", True)
     max_depth = _optional_int_env("FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH", None)
     collection_allowlist = _collection_allowlist_env(
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
@@ -883,7 +1106,13 @@ def fetch_profesores_documents() -> list[Document]:
     Extrae usuarios academicos cuyo tipo sea profesor/administrativo
     y relaciona horario + calendario por ID de documento.
     """
-    client = _build_client_from_env("VITE_FIREBASE_PROJECT_ID", "VITE_FIREBASE_API_KEY")
+    client = _build_client_from_env(
+        "VITE_FIREBASE_PROJECT_ID",
+        "VITE_FIREBASE_API_KEY",
+        service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
+        service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        admin_app_name="firebase_admin_users",
+    )
     if client is None:
         return []
 
@@ -989,11 +1218,17 @@ def _record_payload(record: FirestoreRecord, source_name: str) -> dict[str, Any]
 
 def fetch_salones_raw_records() -> list[dict[str, Any]]:
     """Obtiene toda la informacion de salones en formato crudo (sin Markdown)."""
-    client = _build_client_from_env("VITE_FIREBASE_SALONES_PROJECT_ID", "VITE_FIREBASE_SALONES_API_KEY")
+    client = _build_client_from_env(
+        "VITE_FIREBASE_SALONES_PROJECT_ID",
+        "VITE_FIREBASE_SALONES_API_KEY",
+        service_account_file_var="FIREBASE_SALONES_SERVICE_ACCOUNT_FILE",
+        service_account_json_var="FIREBASE_SALONES_SERVICE_ACCOUNT_JSON",
+        admin_app_name="firebase_admin_salones",
+    )
     if client is None:
         return []
 
-    include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", False)
+    include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", True)
     max_depth = _optional_int_env("FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH", None)
     collection_allowlist = _collection_allowlist_env(
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
@@ -1013,7 +1248,13 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
 
 def fetch_target_users_raw_records() -> list[dict[str, Any]]:
     """Obtiene usuarios academicos objetivo y vincula horarios/calendarios por doc_id."""
-    client = _build_client_from_env("VITE_FIREBASE_PROJECT_ID", "VITE_FIREBASE_API_KEY")
+    client = _build_client_from_env(
+        "VITE_FIREBASE_PROJECT_ID",
+        "VITE_FIREBASE_API_KEY",
+        service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
+        service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        admin_app_name="firebase_admin_users",
+    )
     if client is None:
         return []
 
@@ -1072,6 +1313,114 @@ def fetch_target_users_raw_records() -> list[dict[str, Any]]:
     return payloads
 
 
+def fetch_users_all_raw_records() -> list[dict[str, Any]]:
+    """Obtiene toda la informacion del proyecto de usuarios en formato crudo."""
+    client = _build_client_from_env(
+        "VITE_FIREBASE_PROJECT_ID",
+        "VITE_FIREBASE_API_KEY",
+        service_account_file_var="FIREBASE_USERS_SERVICE_ACCOUNT_FILE",
+        service_account_json_var="FIREBASE_USERS_SERVICE_ACCOUNT_JSON",
+        admin_app_name="firebase_admin_users",
+    )
+    if client is None:
+        return []
+
+    include_subcollections = _bool_env("FIREBASE_USERS_INCLUDE_SUBCOLLECTIONS", True)
+    max_depth = _optional_int_env("FIREBASE_USERS_MAX_TRAVERSAL_DEPTH", None)
+    collection_allowlist = _collection_allowlist_env(
+        "FIREBASE_USERS_COLLECTION_ALLOWLIST",
+        "FIREBASE_USERS_COLLECTIONS",
+    )
+
+    records: list[dict[str, Any]] = []
+    for record in client.iter_documents(
+        collection_allowlist=collection_allowlist,
+        include_subcollections=include_subcollections,
+        max_depth=max_depth,
+    ):
+        records.append(_record_payload(record, "firebase_users_all"))
+
+    return records
+
+
+def _compact_generic_runtime_payload(item: dict[str, Any], *, include_schedule: bool) -> dict[str, Any]:
+    data = item.get("data")
+    compact: dict[str, Any] = {
+        "source": _clean_text(item.get("source")),
+        "collection": _clean_text(item.get("collection")),
+        "doc_id": _clean_text(item.get("doc_id")),
+    }
+
+    if isinstance(data, dict):
+        for key in (
+            "nombre",
+            "name",
+            "nomenclatura",
+            "tipo",
+            "rol",
+            "correo",
+            "email",
+            "descripcion",
+            "estado",
+            "area",
+            "departamento",
+            "ubicacion",
+            "piso",
+        ):
+            value = data.get(key)
+            text = _clean_text(value)
+            if text:
+                compact[key] = text
+
+        horario = data.get("horario")
+        calendario = data.get("calendario")
+        if include_schedule:
+            if horario:
+                compact["horario"] = _compact_horario_payload(horario, max_items=12)
+            if calendario:
+                compact["calendario"] = _compact_nested_payload(calendario, max_items=10, max_depth=2)
+        else:
+            if "horario" in data:
+                compact["tiene_horario"] = bool(horario)
+            if "calendario" in data:
+                compact["tiene_calendario"] = bool(calendario)
+
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in {
+                "horario",
+                "calendario",
+                "nombre",
+                "name",
+                "nomenclatura",
+                "tipo",
+                "rol",
+                "correo",
+                "email",
+                "descripcion",
+                "estado",
+                "area",
+                "departamento",
+                "ubicacion",
+                "piso",
+            }:
+                continue
+            if len(extras) >= 5:
+                break
+            extras[str(key)] = _compact_nested_payload(value, max_items=8, max_depth=1)
+
+        if extras:
+            compact["campos_adicionales"] = extras
+    else:
+        compact["data"] = _compact_nested_payload(data, max_items=8, max_depth=1)
+
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, "", [], {})
+    }
+
+
 def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, Any]:
     """Snapshot en vivo de Firebase para consultas runtime del agente (sin Markdown)."""
     now = time.time()
@@ -1084,6 +1433,7 @@ def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, An
 
     salones: list[dict[str, Any]] = []
     usuarios: list[dict[str, Any]] = []
+    usuarios_all: list[dict[str, Any]] = []
     errors: list[str] = []
 
     try:
@@ -1098,6 +1448,12 @@ def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, An
         errors.append(f"usuarios: {exc}")
         log.warning("No fue posible cargar usuarios en vivo: %s", exc)
 
+    try:
+        usuarios_all = fetch_users_all_raw_records()
+    except Exception as exc:
+        errors.append(f"usuarios_all: {exc}")
+        log.warning("No fue posible cargar colecciones completas de usuarios en vivo: %s", exc)
+
     snapshot = {
         "loaded_at_epoch": now,
         "cache_ttl_seconds": ttl,
@@ -1106,9 +1462,11 @@ def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, An
         "totals": {
             "salones": len(salones),
             "usuarios_objetivo": len(usuarios),
+            "usuarios_all": len(usuarios_all),
         },
         "salones": salones,
         "usuarios": usuarios,
+        "usuarios_all": usuarios_all,
     }
     _runtime_cache["snapshot"] = snapshot
     _runtime_cache["loaded_at"] = now
@@ -1165,7 +1523,7 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         log.warning("No se pudo cargar snapshot Firebase en vivo: %s", exc)
         return {
             "context_text": "",
-            "totals": {"salones": 0, "usuarios_objetivo": 0},
+            "totals": {"salones": 0, "usuarios_objetivo": 0, "usuarios_all": 0},
             "error": str(exc),
             "schedule_details_requested": schedule_details_requested,
         }
@@ -1178,6 +1536,7 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
 
     salones_all = snapshot.get("salones", [])
     usuarios_all = snapshot.get("usuarios", [])
+    usuarios_all_collections = snapshot.get("usuarios_all", [])
 
     salones_scored = sorted(
         ((item, _score_record(item, terms)) for item in salones_all),
@@ -1189,17 +1548,29 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         key=lambda pair: pair[1],
         reverse=True,
     )
+    usuarios_all_collections_scored = sorted(
+        ((item, _score_record(item, terms)) for item in usuarios_all_collections),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
 
     salones_limit = 6 if wants_broad else max(1, max_salones)
     usuarios_limit = 6 if wants_broad else max(1, max_usuarios)
+    usuarios_all_limit = 8 if wants_broad else 3
 
     selected_salones = [item for item, score in salones_scored if score > 0][:salones_limit]
     selected_usuarios = [item for item, score in usuarios_scored if score > 0][:usuarios_limit]
+    selected_usuarios_all = [item for item, score in usuarios_all_collections_scored if score > 0][:usuarios_all_limit]
 
     if not selected_salones:
         selected_salones = [item for item, _ in salones_scored[: min(2, len(salones_scored))]]
     if not selected_usuarios:
         selected_usuarios = [item for item, _ in usuarios_scored[: min(2, len(usuarios_scored))]]
+    if not selected_usuarios_all:
+        selected_usuarios_all = [
+            item
+            for item, _ in usuarios_all_collections_scored[: min(2, len(usuarios_all_collections_scored))]
+        ]
 
     compact_salones = [
         _compact_salon_runtime_payload(item, include_schedule=schedule_details_requested)
@@ -1208,6 +1579,10 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
     compact_usuarios = [
         _compact_user_runtime_payload(item, include_schedule=schedule_details_requested)
         for item in selected_usuarios
+    ]
+    compact_usuarios_all = [
+        _compact_generic_runtime_payload(item, include_schedule=schedule_details_requested)
+        for item in selected_usuarios_all
     ]
 
     salones_json, salones_included, salones_total_selected = _serialize_items_with_char_budget(
@@ -1218,23 +1593,31 @@ def build_firebase_runtime_context(question: str, *, max_salones: int = 3, max_u
         compact_usuarios,
         max_chars=2600,
     )
+    usuarios_all_json, usuarios_all_included, usuarios_all_total_selected = _serialize_items_with_char_budget(
+        compact_usuarios_all,
+        max_chars=2100,
+    )
 
     context_text = (
         "DATOS_OPERATIVOS_UNIVERSIDAD\n"
         f"totales.salones={snapshot.get('totals', {}).get('salones', 0)}\n"
         f"totales.usuarios_objetivo={snapshot.get('totals', {}).get('usuarios_objetivo', 0)}\n"
+        f"totales.usuarios_all={snapshot.get('totals', {}).get('usuarios_all', 0)}\n"
         f"solicitud_horario_detallado={str(schedule_details_requested).lower()}\n"
         f"salones_relevantes_incluidos={salones_included}/{salones_total_selected}\n"
         f"usuarios_relevantes_incluidos={usuarios_included}/{usuarios_total_selected}\n"
+        f"usuarios_all_relevantes_incluidos={usuarios_all_included}/{usuarios_all_total_selected}\n"
         "salones_relevantes_json=\n"
         f"{salones_json}\n"
         "usuarios_relevantes_json=\n"
-        f"{usuarios_json}"
+        f"{usuarios_json}\n"
+        "usuarios_all_relevantes_json=\n"
+        f"{usuarios_all_json}"
     )
 
     return {
         "context_text": context_text,
-        "totals": snapshot.get("totals", {"salones": 0, "usuarios_objetivo": 0}),
+        "totals": snapshot.get("totals", {"salones": 0, "usuarios_objetivo": 0, "usuarios_all": 0}),
         "error": error_text,
         "schedule_details_requested": schedule_details_requested,
     }

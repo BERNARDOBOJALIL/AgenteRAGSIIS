@@ -5,7 +5,7 @@ Proyecto RAG en Python para responder consultas del IDIT con datos unificados de
 - Web scraping
 - PDFs
 - Firestore de salones IDIT (todo)
-- Firestore de usuarios (rol academico + tipo profesor/administrativo)
+- Firestore de usuarios (todas las colecciones + vista objetivo academico)
 
 Web/PDF/DOCX se transforman a Markdown para ChromaDB.
 Firestore se consulta en vivo en runtime del agente (sin convertir a Markdown).
@@ -72,6 +72,12 @@ FIREBASE_CALENDARIOS_COLLECTION=calendarios
 FIREBASE_INCLUDE_SUBCOLLECTIONS=true
 FIREBASE_MAX_TRAVERSAL_DEPTH=2
 FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH=none
+FIREBASE_USERS_INCLUDE_SUBCOLLECTIONS=true
+FIREBASE_USERS_MAX_TRAVERSAL_DEPTH=none
+
+# Si REST no permite descubrir colecciones raiz, define allowlists:
+FIREBASE_SALONES_COLLECTION_ALLOWLIST=salones
+FIREBASE_USERS_COLLECTION_ALLOWLIST=usuarios,horarios,calendarios
 
 FIREBASE_PROFESSOR_FIELD_MARKERS=rol,role,tipo_usuario,teacher,is_professor
 FIREBASE_PROFESSOR_VALUE_MARKERS=profesor,docente,teacher,faculty
@@ -80,11 +86,39 @@ FIREBASE_TARGET_TYPES=profesor,administrativo,aminisrativo
 FIREBASE_RUNTIME_CACHE_TTL_SECONDS=45
 ```
 
+### Acceso total recomendado (Firebase Admin SDK)
+
+Para acceder a todas las colecciones/subcolecciones de ambos proyectos sin limites de descubrimiento REST,
+configura service account por proyecto (archivo o JSON en variable):
+
+```env
+# Proyecto salones
+FIREBASE_SALONES_SERVICE_ACCOUNT_FILE=C:/ruta/sa-salones.json
+# O equivalente embebido:
+# FIREBASE_SALONES_SERVICE_ACCOUNT_JSON={...json...}
+# FIREBASE_SALONES_SERVICE_ACCOUNT_JSON_BASE64=...
+
+# Proyecto usuarios
+FIREBASE_USERS_SERVICE_ACCOUNT_FILE=C:/ruta/sa-usuarios.json
+# O equivalente embebido:
+# FIREBASE_USERS_SERVICE_ACCOUNT_JSON={...json...}
+# FIREBASE_USERS_SERVICE_ACCOUNT_JSON_BASE64=...
+```
+
+Tambien se acepta fallback global:
+
+```env
+GOOGLE_APPLICATION_CREDENTIALS=C:/ruta/service-account.json
+FIREBASE_SERVICE_ACCOUNT_JSON={...json...}
+FIREBASE_SERVICE_ACCOUNT_JSON_BASE64=...
+```
+
 Nota: la fuente de salones se recorre completa por defecto (todas las colecciones y documentos). Solo usa `FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH` si quieres limitar profundidad.
 
 Nota: en runtime, el agente consulta Firebase en vivo para:
 - Salones: toda la informacion disponible.
 - Usuarios: `rol=academico` y `tipo` profesor/administrativo (incluye variantes tipograficas).
+- Usuarios (full): muestra tambien registros relevantes de cualquier coleccion/subcoleccion para responder preguntas fuera del subset objetivo.
 - Join por `doc_id` con colecciones de horarios y calendarios.
 
 ## Formato Markdown unificado

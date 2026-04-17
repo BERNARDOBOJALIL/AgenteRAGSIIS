@@ -13,3 +13,4 @@ beautifulsoup4
 requests
 python-dotenv
 python-docx
+firebase-admin
