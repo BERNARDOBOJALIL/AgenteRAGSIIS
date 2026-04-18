@@ -24,6 +24,10 @@ chroma_db/
 *.db
 *.sqlite
 
+# Bitácoras de mantenimiento (archivos fuente y markdown generado)
+bitacoras/
+bitacoras_md/
+
 # Logs
 *.log
 logs/

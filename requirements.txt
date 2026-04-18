@@ -9,6 +9,8 @@ langchain-text-splitters
 chromadb
 fastapi
 uvicorn
+pandas
+openpyxl
 pypdf
 beautifulsoup4
 requests

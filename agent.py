@@ -121,6 +121,15 @@ Reglas obligatorias:
 - Nunca menciones fuentes técnicas o internas (Firebase, Chroma, JSON, API, logs, permisos).
 - Para preguntas de salones, prioriza equipamiento y ubicación aproximada (piso, zona y referencias).
 - Incluye horarios detallados solo cuando el usuario lo pida explícitamente.
+
+Uso de tools:
+- Para preguntas sobre equipos, máquinas, instrumentos o herramientas del IDIT (características técnicas,
+  especificaciones, ubicación, responsable, mantenimiento, uso permitido), usa buscar_equipos_idit.
+  Si el usuario menciona una sección específica (ej. FABLAB, ELECTRONICA), pasa ese dato al parámetro seccion.
+  Si pregunta por un tipo específico de información (ej. plan de mantenimiento), pasa el valor al parámetro chunk_type.
+- Para preguntas sobre información general e institucional del IDIT (qué es el IDIT, servicios disponibles,
+  tecnologías, áreas, programas académicos, descripción de laboratorios), usa buscar_informacion_idit.
+- Nunca respondas preguntas sobre equipos o información institucional sin consultar primero las tools correspondientes.
 """
 
 
@@ -1043,21 +1052,132 @@ def _history_to_messages(historial: list[dict]) -> list[BaseMessage]:
 
 def build_graph(vector_store: Chroma, frontend_context: str | None = None):
     llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
-    tools = [buscar_salones_idit, buscar_personal_idit, obtener_agenda_personal_idit]
+    
+    # Definir tools de ChromaDB con closure sobre vector_store
+    @tool("buscar_equipos_idit")
+    def buscar_equipos_idit(query: str, seccion: str = "", chunk_type: str = "") -> str:
+        """Busca equipos y máquinas del IDIT en las bitácoras de mantenimiento.
+
+        Usa esta tool cuando el usuario pregunte sobre equipos, máquinas, instrumentos
+        o herramientas del IDIT: qué hace un equipo, dónde está, quién lo opera,
+        sus características técnicas, especificaciones, materiales, plan de mantenimiento
+        o uso permitido.
+
+        Args:
+            query: Consulta libre en español sobre el equipo o máquina.
+            seccion: Filtro opcional por sección del IDIT (ej. "FABLAB", "ELECTRONICA").
+                     Dejar vacío para buscar en todas las secciones.
+            chunk_type: Filtro opcional por tipo de chunk:
+                        "descripcion" para info técnica general,
+                        "mantenimiento_interno" para plan de mantenimiento,
+                        "mantenimiento_externo" para historial externo.
+                        Dejar vacío para buscar en todos los tipos.
+
+        Returns:
+            str: JSON con lista de equipos encontrados y su información estructurada.
+        """
+        where_filter = {"fuente": {"$eq": "bitacora_mantenimiento"}}
+        if seccion.strip():
+            where_filter = {
+                "$and": [
+                    where_filter,
+                    {"seccion": {"$eq": seccion.strip().upper()}},
+                ]
+            }
+        if chunk_type.strip():
+            where_filter = {
+                "$and": [
+                    where_filter,
+                    {"chunk_type": {"$eq": chunk_type.strip()}},
+                ]
+            }
+
+        docs = vector_store.similarity_search(query, k=6, filter=where_filter)
+
+        matches = []
+        seen_machines = set()
+        for doc in docs:
+            meta = doc.metadata
+            machine_key = f"{meta.get('maquina','')}_{meta.get('chunk_type','')}"
+            if machine_key in seen_machines:
+                continue
+            seen_machines.add(machine_key)
+            matches.append({
+                "maquina": meta.get("maquina", ""),
+                "seccion": meta.get("seccion", ""),
+                "ubicacion": meta.get("ubicacion", ""),
+                "responsable": meta.get("responsable", ""),
+                "actualizacion": meta.get("actualizacion", ""),
+                "chunk_type": meta.get("chunk_type", ""),
+                "contenido": doc.page_content[:1200],
+            })
+
+        payload = {
+            "query": query,
+            "total_matches": len(matches),
+            "matches": matches,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    @tool("buscar_informacion_idit")
+    def buscar_informacion_idit(query: str, categoria: str = "") -> str:
+        """Busca información general e institucional del IDIT.
+
+        Usa esta tool cuando el usuario pregunte sobre qué es el IDIT, sus servicios,
+        tecnologías disponibles, áreas de trabajo, programas académicos, descripción
+        general de laboratorios, información de contacto, o cualquier información
+        de tipo institucional que no sea sobre un equipo o máquina específica ni
+        sobre salones, horarios o personal.
+
+        Args:
+            query: Consulta libre en español sobre información del IDIT.
+            categoria: Filtro opcional por categoría del documento.
+                       Dejar vacío para buscar en todos los documentos de conocimiento.
+
+        Returns:
+            str: JSON con fragmentos de información relevante encontrados.
+        """
+        where_filter = {"fuente": {"$eq": "web_scraping"}}
+        if categoria.strip():
+            where_filter = {
+                "$and": [
+                    where_filter,
+                    {"categoria": {"$eq": categoria.strip()}},
+                ]
+            }
+
+        docs = vector_store.similarity_search(query, k=5, filter=where_filter)
+
+        matches = []
+        for doc in docs:
+            meta = doc.metadata
+            matches.append({
+                "titulo": meta.get("titulo", meta.get("url", "")),
+                "categoria": meta.get("categoria", ""),
+                "url": meta.get("url", ""),
+                "fecha": meta.get("fecha_normalizacion_utc", ""),
+                "contenido": doc.page_content[:1000],
+            })
+
+        payload = {
+            "query": query,
+            "total_matches": len(matches),
+            "matches": matches,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+    
+    tools = [
+        buscar_salones_idit,
+        buscar_personal_idit,
+        obtener_agenda_personal_idit,
+        buscar_equipos_idit,
+        buscar_informacion_idit,
+    ]
     model_with_tools = llm.bind_tools(tools)
     tool_node = ToolNode(tools)
 
     def retrieve_context(state: AgentState) -> dict[str, Any]:
         question = str(state.get("question") or "").strip()
-
-        resultados = vector_store.similarity_search(question, k=3)
-        contexto_chroma: list[str] = []
-        for doc in resultados:
-            fuente = doc.metadata.get("fuente", "desconocida")
-            categoria = doc.metadata.get("categoria", "general")
-            contexto_chroma.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
-
-        chroma_context = "\n\n---\n\n".join(contexto_chroma) if contexto_chroma else "Sin contexto Chroma"
 
         firebase_runtime = build_firebase_runtime_context(
             question,
@@ -1066,16 +1186,14 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
         firebase_context = str(firebase_runtime.get("context_text") or "Sin datos operativos")
 
         context_block = (
-            "[CONTEXTO INSTITUCIONAL]\n"
-            f"{chroma_context}\n\n"
-            "[DATOS OPERATIVOS EN VIVO]\n"
+            "[DATOS OPERATIVOS EN VIVO - FIREBASE]\n"
             f"{firebase_context}\n\n"
             "[PREGUNTA]\n"
             f"{question}"
         )
 
         return {
-            "chroma_context": chroma_context,
+            "chroma_context": "",
             "firebase_context": firebase_context,
             "messages": [HumanMessage(content=context_block)],
         }
