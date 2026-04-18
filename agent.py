@@ -3,16 +3,26 @@ import os
 import re
 import json
 import unicodedata
-from typing import Any
+from difflib import SequenceMatcher
+from typing import Annotated, Any, TypedDict
 
 import chromadb
 from dotenv import load_dotenv
 from firebase_sources import build_firebase_runtime_context, fetch_firebase_live_snapshot
 from langchain_chroma import Chroma
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
+try:
+    from langchain_core.callbacks import ConsoleCallbackHandler
+except ImportError:
+    from langchain_core.tracers import ConsoleCallbackHandler
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)  # silenciar logs de LangChain en chat
@@ -27,6 +37,7 @@ CHROMA_CLOUD_HOST = os.getenv("CHROMA_CLOUD_HOST", "api.trychroma.com")
 CHROMA_CLOUD_PORT = int(os.getenv("CHROMA_CLOUD_PORT", "443"))
 TOOL_MAX_MATCHES = int(os.getenv("AGENT_TOOL_MAX_MATCHES", "6"))
 TOOL_MAX_ROUNDS = int(os.getenv("AGENT_TOOL_MAX_ROUNDS", "3"))
+AGENT_DEBUG_TRACE = os.getenv("AGENT_DEBUG_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 SALON_CODE_PATTERN = re.compile(r"\bj[\s_-]?\d{1,3}(?:-[a-z])?\b", flags=re.IGNORECASE)
 HORARIO_CLASS_NAME_KEYS = (
     "clase",
@@ -46,25 +57,70 @@ HORARIO_CLASS_NAME_KEYS = (
 )
 HORARIO_GROUP_KEYS = ("grupo", "grupos", "seccion", "secciones")
 HORARIO_TEACHER_KEYS = ("profesor", "docente", "maestro")
+SALON_SHORT_QUERY_TOKENS = {"ia", "ai", "ar", "ra", "vr", "ml", "xr", "3d", "ti", "ux", "ui"}
+SALON_TERM_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "ia": ("inteligencia", "artificial"),
+    "ai": ("inteligencia", "artificial"),
+    "ar": ("realidad", "aumentada"),
+    "ra": ("realidad", "aumentada"),
+    "vr": ("realidad", "virtual"),
+    "ml": ("machine", "learning", "aprendizaje"),
+    "fablab": ("fabricacion", "digital"),
+    "labs": ("laboratorio",),
+    "lab": ("laboratorio",),
+}
+SALON_PHRASE_HINTS: dict[str, tuple[str, ...]] = {
+    "ia": ("inteligencia artificial",),
+    "ai": ("inteligencia artificial",),
+    "ar": ("realidad aumentada",),
+    "ra": ("realidad aumentada",),
+    "vr": ("realidad virtual",),
+    "ml": ("machine learning", "aprendizaje automatico"),
+}
+SALON_GENERIC_TERMS = {
+    "salon",
+    "salones",
+    "laboratorio",
+    "laboratorios",
+    "aula",
+    "aulas",
+    "proyecto",
+    "proyectos",
+    "espacio",
+    "espacios",
+}
+SALON_HIGH_SIGNAL_TERMS = {
+    "ia",
+    "ai",
+    "ar",
+    "ra",
+    "vr",
+    "ml",
+    "xr",
+    "3d",
+    "inteligencia",
+    "artificial",
+    "biometrica",
+    "neuromarketing",
+    "robotica",
+    "aumentada",
+    "virtual",
+    "fabrica",
+    "fabricacion",
+    "digital",
+}
 
 SYSTEM_PROMPT = """Eres un asistente virtual amable y preciso de la universidad.
-Tu trabajo es responder preguntas de los alumnos usando UNICAMENTE la informacion
-disponible en el contexto proporcionado.
 
 Reglas obligatorias:
-- Responde siempre en espanol, claro y conciso.
+- Responde siempre en español, claro y conciso.
+- Usa únicamente la información del contexto proporcionado.
 - Si no hay datos suficientes, responde exactamente: "No tengo esa información disponible."
-- Nunca inventes datos, horarios, nombres o requisitos.
-- Nunca proporciones informacion personal o sensible de usuarios tipo alumno/estudiante.
-- Si te piden informacion de un alumno, responde exactamente: "No tengo esa información disponible."
-- Nunca menciones fuentes tecnicas, infraestructura o errores internos (Firebase, Chroma, API, JSON, permisos, logs, etc.).
-- Nunca uses frases como "segun el contexto de Firebase", "segun el JSON" o equivalentes tecnicos.
-- Para preguntas de salones, prioriza equipamiento y ubicacion aproximada (piso, zona y referencias cercanas).
-- Si no hay equipamiento explicito pero existe equipamiento_inferido_conservador, puedes usarlo con lenguaje prudente ("es probable que", "podria contar con") y aclarar que es una estimacion.
-- Solo comparte horario/calendario detallado cuando el usuario lo pida de forma explicita.
-- Si piden como llegar, da indicaciones aproximadas y humanas; evita una ruta exacta paso a paso.
-- Responde siempre en español.
-- Se amable y usa un tono cercano pero profesional.
+- Nunca inventes datos, horarios, nombres, requisitos o personas.
+- Nunca proporciones información personal o sensible de alumnos.
+- Nunca menciones fuentes técnicas o internas (Firebase, Chroma, JSON, API, logs, permisos).
+- Para preguntas de salones, prioriza equipamiento y ubicación aproximada (piso, zona y referencias).
+- Incluye horarios detallados solo cuando el usuario lo pida explícitamente.
 """
 
 
@@ -101,6 +157,234 @@ def _tokenize_for_tool_search(question: str) -> set[str]:
     normalized = _normalize_lookup_text(question)
     tokens = [tok for tok in re.split(r"[^a-z0-9]+", normalized) if len(tok) >= 3]
     return {tok for tok in tokens if tok not in stopwords}
+
+
+def _contains_term_with_boundaries(text: str, term: str) -> bool:
+    if not text or not term:
+        return False
+    if " " in term:
+        return term in text
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text))
+
+
+def _normalized_word_tokens(text: str) -> set[str]:
+    return {tok for tok in re.split(r"[^a-z0-9]+", text or "") if tok}
+
+
+def _contains_approx_term(tokens: set[str], term: str, min_ratio: float = 0.83) -> bool:
+    if not term or len(term) < 6 or not tokens:
+        return False
+
+    term_prefix = term[:6]
+    for token in tokens:
+        if len(token) < 6:
+            continue
+        if abs(len(token) - len(term)) > 4:
+            continue
+        if token.startswith(term_prefix) or term.startswith(token[:6]):
+            return True
+        if SequenceMatcher(None, token, term).ratio() >= min_ratio:
+            return True
+
+    return False
+
+
+def _expand_salon_query_terms(base_terms: set[str]) -> set[str]:
+    expanded: set[str] = set()
+
+    for raw_term in base_terms:
+        term = _normalize_lookup_text(raw_term)
+        if not term:
+            continue
+
+        expanded.add(term)
+
+        if term.endswith("es") and len(term) > 4:
+            expanded.add(term[:-2])
+        elif term.endswith("s") and len(term) > 4:
+            expanded.add(term[:-1])
+
+        for extra in SALON_TERM_EXPANSIONS.get(term, ()): 
+            expanded.add(extra)
+
+    return expanded
+
+
+def _salon_phrase_hints_from_terms(base_terms: set[str]) -> set[str]:
+    hints: set[str] = set()
+    for raw_term in base_terms:
+        term = _normalize_lookup_text(raw_term)
+        for phrase in SALON_PHRASE_HINTS.get(term, ()): 
+            hints.add(phrase)
+    return hints
+
+
+def _salon_term_weight(term: str) -> int:
+    if term in SALON_HIGH_SIGNAL_TERMS:
+        return 6
+    if len(term) >= 11:
+        return 5
+    if len(term) >= 8:
+        return 4
+    if len(term) >= 5:
+        return 3
+    return 2
+
+
+def _score_salon_item_detailed(
+    item: dict[str, Any],
+    normalized_query: str,
+    terms: set[str],
+) -> tuple[int, dict[str, Any]]:
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    nomenclatura = str(data.get("nomenclatura") or item.get("doc_id") or "").strip()
+    nombre = str(data.get("nombre") or "").strip()
+
+    nomen_norm = _normalize_lookup_text(nomenclatura)
+    nombre_norm = _normalize_lookup_text(nombre)
+    tipo_norm = _normalize_lookup_text(data.get("tipo"))
+
+    blob_parts = [
+        nomen_norm,
+        nombre_norm,
+        tipo_norm,
+        _normalize_lookup_text(data.get("piso")),
+        _normalize_lookup_text(data.get("tipoHorario")),
+        _normalize_lookup_text(_format_clases_resumen(data.get("horario"), max_items=8)),
+        " ".join(_normalize_lookup_text(eq) for eq in data.get("equipamiento", []) if isinstance(eq, str)),
+        " ".join(_normalize_lookup_text(name) for name in _extract_responsable_names(data.get("responsables"), max_items=8)),
+    ]
+    blob = " ".join(part for part in blob_parts if part)
+    nomen_tokens = _normalized_word_tokens(nomen_norm)
+    nombre_tokens = _normalized_word_tokens(nombre_norm)
+    tipo_tokens = _normalized_word_tokens(tipo_norm)
+    blob_tokens = _normalized_word_tokens(blob)
+
+    short_terms = {
+        tok
+        for tok in re.split(r"[^a-z0-9]+", normalized_query)
+        if len(tok) == 2 and tok in SALON_SHORT_QUERY_TOKENS
+    }
+    base_terms = {term for term in terms if term} | short_terms
+    expanded_terms = _expand_salon_query_terms(base_terms)
+    phrase_hints = _salon_phrase_hints_from_terms(base_terms)
+
+    score = 0
+    score_components: dict[str, int] = {}
+    matched_terms: set[str] = set()
+    matched_phrases: set[str] = set()
+    field_hits = {"nomenclatura": 0, "nombre": 0, "tipo": 0, "blob": 0}
+
+    def add_component(component: str, value: int) -> None:
+        nonlocal score
+        if value == 0:
+            return
+        score += value
+        score_components[component] = score_components.get(component, 0) + value
+
+    if normalized_query:
+        if normalized_query in nomen_norm:
+            add_component("exact_query_nomenclatura", 34)
+        if normalized_query in nombre_norm:
+            add_component("exact_query_nombre", 22)
+        if normalized_query in tipo_norm:
+            add_component("exact_query_tipo", 16)
+        elif normalized_query in blob:
+            add_component("exact_query_blob", 7)
+
+    code_match = SALON_CODE_PATTERN.search(normalized_query)
+    if code_match:
+        asked_code = _normalize_salon_code(code_match.group(0))
+        item_code = _normalize_salon_code(nomenclatura)
+        if asked_code and asked_code == item_code:
+            add_component("exact_code_match", 120)
+        elif asked_code and asked_code in item_code:
+            add_component("partial_code_match", 28)
+
+    for phrase in sorted(phrase_hints):
+        if phrase in nombre_norm:
+            add_component(f"phrase_nombre:{phrase}", 24)
+            matched_phrases.add(phrase)
+            field_hits["nombre"] += 1
+        elif phrase in tipo_norm:
+            add_component(f"phrase_tipo:{phrase}", 18)
+            matched_phrases.add(phrase)
+            field_hits["tipo"] += 1
+        elif phrase in blob:
+            add_component(f"phrase_blob:{phrase}", 9)
+            matched_phrases.add(phrase)
+            field_hits["blob"] += 1
+
+    for term in sorted(expanded_terms):
+        weight = _salon_term_weight(term)
+        if _contains_term_with_boundaries(nomen_norm, term):
+            add_component(f"term_nomenclatura:{term}", weight * 7)
+            matched_terms.add(term)
+            field_hits["nomenclatura"] += 1
+        elif _contains_term_with_boundaries(nombre_norm, term):
+            add_component(f"term_nombre:{term}", weight * 6)
+            matched_terms.add(term)
+            field_hits["nombre"] += 1
+        elif _contains_term_with_boundaries(tipo_norm, term):
+            add_component(f"term_tipo:{term}", weight * 5)
+            matched_terms.add(term)
+            field_hits["tipo"] += 1
+        elif _contains_term_with_boundaries(blob, term):
+            add_component(f"term_blob:{term}", weight * 2)
+            matched_terms.add(term)
+            field_hits["blob"] += 1
+        elif _contains_approx_term(nomen_tokens, term):
+            add_component(f"term_nomenclatura_aprox:{term}", weight * 4)
+            matched_terms.add(term)
+            field_hits["nomenclatura"] += 1
+        elif _contains_approx_term(nombre_tokens, term):
+            add_component(f"term_nombre_aprox:{term}", weight * 4)
+            matched_terms.add(term)
+            field_hits["nombre"] += 1
+        elif _contains_approx_term(tipo_tokens, term):
+            add_component(f"term_tipo_aprox:{term}", weight * 3)
+            matched_terms.add(term)
+            field_hits["tipo"] += 1
+        elif _contains_approx_term(blob_tokens, term):
+            add_component(f"term_blob_aprox:{term}", weight)
+            matched_terms.add(term)
+            field_hits["blob"] += 1
+
+    coverage_ratio = 0.0
+    if expanded_terms:
+        coverage_ratio = len(matched_terms) / len(expanded_terms)
+        add_component("term_coverage_bonus", int(round(coverage_ratio * 16)))
+
+    if len(matched_terms) >= 3:
+        add_component("multi_term_bonus", 8)
+
+    if matched_phrases and len(matched_terms) >= 2:
+        add_component("phrase_alignment_bonus", 10)
+
+    specific_terms = [term for term in matched_terms if term not in SALON_GENERIC_TERMS]
+    if matched_terms and not specific_terms:
+        add_component("generic_match_penalty", -4)
+
+    if score < 0:
+        score = 0
+
+    top_components = [
+        {"component": name, "value": value}
+        for name, value in sorted(score_components.items(), key=lambda pair: abs(pair[1]), reverse=True)[:8]
+    ]
+
+    details: dict[str, Any] = {
+        "base_terms": sorted(base_terms),
+        "expanded_terms": sorted(expanded_terms),
+        "matched_terms": sorted(matched_terms),
+        "matched_phrases": sorted(matched_phrases),
+        "coverage_ratio": round(coverage_ratio, 3),
+        "specific_terms_matched": len(specific_terms),
+        "field_hits": field_hits,
+        "top_score_components": top_components,
+    }
+
+    return score, details
 
 
 def _extract_responsable_names(values: Any, max_items: int = 4) -> list[str]:
@@ -343,42 +627,7 @@ def _infer_salon_location_for_tool(item: dict[str, Any], data: dict[str, Any]) -
 
 
 def _score_salon_item(item: dict[str, Any], normalized_query: str, terms: set[str]) -> int:
-    data = item.get("data") if isinstance(item.get("data"), dict) else {}
-    nomenclatura = str(data.get("nomenclatura") or item.get("doc_id") or "").strip()
-    nombre = str(data.get("nombre") or "").strip()
-
-    nomen_norm = _normalize_lookup_text(nomenclatura)
-    nombre_norm = _normalize_lookup_text(nombre)
-    tipo_norm = _normalize_lookup_text(data.get("tipo"))
-
-    blob_parts = [
-        nomen_norm,
-        nombre_norm,
-        tipo_norm,
-        _normalize_lookup_text(data.get("piso")),
-        _normalize_lookup_text(data.get("tipoHorario")),
-        _normalize_lookup_text(_format_clases_resumen(data.get("horario"), max_items=8)),
-        " ".join(_normalize_lookup_text(eq) for eq in data.get("equipamiento", []) if isinstance(eq, str)),
-        " ".join(_normalize_lookup_text(name) for name in _extract_responsable_names(data.get("responsables"), max_items=8)),
-    ]
-    blob = " ".join(part for part in blob_parts if part)
-
-    score = 0
-    if normalized_query and normalized_query in nombre_norm:
-        score += 16
-    if normalized_query and normalized_query in nomen_norm:
-        score += 18
-    if normalized_query and normalized_query in blob:
-        score += 6
-
-    for term in terms:
-        if term in nombre_norm:
-            score += 4
-        elif term in nomen_norm:
-            score += 5
-        elif term in blob:
-            score += 1
-
+    score, _ = _score_salon_item_detailed(item, normalized_query, terms)
     return score
 
 
@@ -621,15 +870,22 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
     normalized_query = _normalize_lookup_text(query)
     terms = _tokenize_for_tool_search(query)
 
-    scored: list[tuple[int, dict[str, Any]]] = []
+    scored: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
     for item in salones:
         if not isinstance(item, dict):
             continue
-        score = _score_salon_item(item, normalized_query, terms)
+        score, score_debug = _score_salon_item_detailed(item, normalized_query, terms)
         if score > 0:
-            scored.append((score, item))
+            scored.append((score, item, score_debug))
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            float(pair[2].get("coverage_ratio") or 0.0),
+            int(pair[2].get("specific_terms_matched") or 0),
+        ),
+        reverse=True,
+    )
 
     limit = max(1, min(max_matches, 12))
     if not scored:
@@ -642,9 +898,10 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
         "total_matches": len(selected),
         "matches": [
             _serialize_salon_for_tool(item, score, include_schedule=include_schedule)
-            for score, item in selected
+            for score, item, _ in selected
         ],
     }
+
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -696,6 +953,7 @@ def buscar_personal_idit(query: str, max_matches: int = 5, include_schedule: boo
             for score, item in selected
         ],
     }
+
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -749,462 +1007,112 @@ def obtener_agenda_personal_idit(query: str, max_matches: int = 3, include_detai
             for score, item in selected
         ],
     }
+
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _question_needs_salon_disambiguation(question: str) -> bool:
-    normalized = _normalize_lookup_text(question)
-    markers = {
-        "donde",
-        "ubic",
-        "horario",
-        "disponible",
-        "salon",
-        "servicio",
-        "fablab",
-        "laboratorio",
-        "clase",
-        "clases",
-        "materia",
-        "materias",
-        "grupo",
-        "grupos",
-    }
-    return any(marker in normalized for marker in markers)
-
-
-def _question_requests_salon_classes(question: str) -> bool:
-    normalized = _normalize_lookup_text(question)
-    markers = {
-        "clase",
-        "clases",
-        "materia",
-        "materias",
-        "asignatura",
-        "asignaturas",
-        "curso",
-        "cursos",
-        "grupo",
-        "grupos",
-        "que se imparte",
-        "que se da",
-        "que dan",
-    }
-    return any(marker in normalized for marker in markers)
 
 
 def _normalize_salon_code(value: Any) -> str:
     return _normalize_lookup_text(value).replace(" ", "").replace("_", "")
 
 
-def _build_exact_salon_response(question: str, salones_payload: dict[str, Any]) -> str:
-    code_match = SALON_CODE_PATTERN.search(question or "")
-    if not code_match:
-        return ""
-
-    asked_code = _normalize_salon_code(code_match.group(0))
-    matches = salones_payload.get("matches") if isinstance(salones_payload, dict) else None
-    if not isinstance(matches, list) or not matches:
-        return ""
-
-    selected = None
-    for item in matches:
-        if not isinstance(item, dict):
-            continue
-        item_code = _normalize_salon_code(item.get("nomenclatura") or item.get("doc_id") or "")
-        if item_code == asked_code:
-            selected = item
-            break
-
-    if not isinstance(selected, dict):
-        return ""
-
-    codigo = str(selected.get("nomenclatura") or selected.get("doc_id") or "Sin código").strip()
-    nombre = str(selected.get("nombre") or "Sin nombre").strip()
-    piso = str(selected.get("piso") or "No disponible").strip()
-    ubicacion = str(
-        selected.get("ubicacion_aproximada")
-        or selected.get("ubicacion_descriptiva")
-        or "No disponible"
-    ).strip()
-    horario_resumen = str(selected.get("horario_resumen") or "No disponible").strip()
-
-    piso_norm = _normalize_lookup_text(piso)
-    ubicacion_norm = _normalize_lookup_text(ubicacion)
-    if piso and piso != "No disponible" and piso_norm and piso_norm in ubicacion_norm:
-        ubicacion_txt = ubicacion
-    elif piso and piso != "No disponible" and ubicacion and ubicacion != "No disponible":
-        ubicacion_txt = f"{piso}, {ubicacion}"
-    elif piso and piso != "No disponible":
-        ubicacion_txt = piso
-    else:
-        ubicacion_txt = ubicacion
-
-    responsables = selected.get("responsables") if isinstance(selected.get("responsables"), list) else []
-    responsables_txt = ", ".join(str(x).strip() for x in responsables[:2] if str(x).strip()) or "No disponible"
-
-    clases_requested = _question_requests_salon_classes(question)
-    clases_resumen = str(selected.get("clases_resumen") or "No disponible").strip()
-    clases_line = ""
-    if clases_requested:
-        if clases_resumen and clases_resumen != "No disponible":
-            clases_line = f" Clases registradas: {clases_resumen}."
-        else:
-            clases_line = " No hay clases registradas para ese salon en los datos actuales."
-
-    return (
-        f"{codigo} ({nombre}) se ubica en {ubicacion_txt}. "
-        f"Horario: {horario_resumen}. "
-        f"Responsable: {responsables_txt}."
-        f"{clases_line}"
-    )
-
-
-def _build_multi_match_salon_response(question: str, salones_payload: dict[str, Any]) -> str:
-    if not _question_needs_salon_disambiguation(question):
-        return ""
-
-    if SALON_CODE_PATTERN.search(question or ""):
-        return ""
-
-    matches = salones_payload.get("matches") if isinstance(salones_payload, dict) else None
-    if not isinstance(matches, list) or len(matches) < 2:
-        return ""
-
-    first_name = _normalize_lookup_text(matches[0].get("nombre")) if isinstance(matches[0], dict) else ""
-    same_name_matches = [
-        item
-        for item in matches
-        if isinstance(item, dict) and first_name and _normalize_lookup_text(item.get("nombre")) == first_name
-    ]
-
-    selected = same_name_matches[:3] if len(same_name_matches) >= 2 else [m for m in matches[:3] if isinstance(m, dict)]
-    if len(selected) < 2:
-        return ""
-
-    lines = [
-        "Encontré varias coincidencias y las enumero para evitar ambigüedad:",
-    ]
-    include_clases = _question_requests_salon_classes(question)
-
-    for idx, item in enumerate(selected, start=1):
-        codigo = str(item.get("nomenclatura") or item.get("doc_id") or "Sin código").strip()
-        nombre = str(item.get("nombre") or "Sin nombre").strip()
-        piso = str(item.get("piso") or "No disponible").strip()
-        ubicacion = str(item.get("ubicacion_aproximada") or "No disponible").strip()
-        horario_resumen = str(item.get("horario_resumen") or "No disponible").strip()
-        clases_resumen = str(item.get("clases_resumen") or "No disponible").strip()
-
-        piso_norm = _normalize_lookup_text(piso)
-        ubicacion_norm = _normalize_lookup_text(ubicacion)
-        if piso and piso != "No disponible" and piso_norm and piso_norm in ubicacion_norm:
-            ubicacion_txt = ubicacion
-        elif piso and piso != "No disponible" and ubicacion and ubicacion != "No disponible":
-            ubicacion_txt = f"{piso}, {ubicacion}"
-        elif piso and piso != "No disponible":
-            ubicacion_txt = piso
-        else:
-            ubicacion_txt = ubicacion
-
-        equipamiento = item.get("equipamiento") if isinstance(item.get("equipamiento"), list) else []
-        responsables = item.get("responsables") if isinstance(item.get("responsables"), list) else []
-        equipamiento_txt = ", ".join(str(x).strip() for x in equipamiento[:4] if str(x).strip()) or "No disponible"
-        responsables_txt = ", ".join(str(x).strip() for x in responsables[:2] if str(x).strip()) or "No disponible"
-
-        clase_txt = f" Clases: {clases_resumen}." if include_clases else ""
-
-        lines.append(
-            f"{idx}. {codigo} - {nombre}. Ubicación: {ubicacion_txt}. Horario: {horario_resumen}. "
-            f"Responsable: {responsables_txt}. Equipamiento: {equipamiento_txt}.{clase_txt}"
-        )
-
-    lines.append("Si me indicas el código exacto (por ejemplo, J-001 o J-001-A), te doy la respuesta puntual.")
-    return "\n".join(lines)
-
-
-def _question_requests_personal_info(question: str) -> bool:
-    normalized = _normalize_lookup_text(question)
-    markers = {
-        "profesor",
-        "profesora",
-        "docente",
-        "academico",
-        "academica",
-        "usuario",
-        "personal",
-        "agenda",
-        "calendario",
-        "citas",
-        "notificaciones",
-        "correo",
-        "horario",
-        "horarios",
-        "opera",
-        "responsable",
-    }
-    return any(marker in normalized for marker in markers)
-
-
-def _build_personal_agenda_response(question: str, agenda_payload: dict[str, Any]) -> str:
-    matches = agenda_payload.get("matches") if isinstance(agenda_payload, dict) else None
-    if not isinstance(matches, list) or not matches:
-        return ""
-
-    if not _question_requests_personal_info(question):
-        return ""
-
-    selected = [item for item in matches[:3] if isinstance(item, dict)]
-    if not selected:
-        return ""
-
-    if len(selected) == 1:
-        item = selected[0]
-        nombre = str(item.get("nombre") or "No disponible").strip()
-        rol = str(item.get("rol") or "No disponible").strip()
-        tipo = str(item.get("tipo") or "No disponible").strip()
-        correo = str(item.get("correo") or "No disponible").strip()
-        horario_resumen = str(item.get("horario_resumen") or "No disponible").strip()
-
-        salon = item.get("salon_principal") if isinstance(item.get("salon_principal"), dict) else {}
-        salones_rel = item.get("salones_relacionados") if isinstance(item.get("salones_relacionados"), list) else []
-        salon_cod = str(salon.get("nomenclatura") or "").strip()
-        salon_nom = str(salon.get("nombre") or "").strip()
-        salon_piso = str(salon.get("piso") or "").strip()
-
-        calendario_txt = "registrado" if bool(item.get("calendario_registrado")) else "sin registro"
-        citas_total = int(item.get("citas_total") or 0)
-        notifs_total = int(item.get("notificaciones_total") or 0)
-
-        if salon_cod or salon_nom:
-            salon_line = f"Opera principalmente en {salon_cod or salon_nom}"
-            if salon_nom and salon_cod and salon_nom != salon_cod:
-                salon_line += f" ({salon_nom})"
-            if salon_piso:
-                salon_line += f", {salon_piso}"
-            salon_line += "."
-        elif salones_rel:
-            codigos = [
-                str(s.get("nomenclatura") or s.get("nombre") or "").strip()
-                for s in salones_rel[:3]
-                if isinstance(s, dict)
-            ]
-            codigos = [c for c in codigos if c]
-            if codigos:
-                salon_line = f"Salones relacionados: {', '.join(codigos)}."
-            else:
-                salon_line = "No hay un salón principal claramente asociado."
-        else:
-            salon_line = "No hay un salón principal claramente asociado."
-
-        return (
-            f"Información de {nombre}: rol {rol}, tipo {tipo}. "
-            f"Correo: {correo}. {salon_line} "
-            f"Horario: {horario_resumen}. "
-            f"Calendario: {calendario_txt}. "
-            f"Citas registradas: {citas_total}. "
-            f"Notificaciones registradas: {notifs_total}."
-        )
-
-    lines = ["Encontré varias coincidencias de personal y las enumero:"]
-    for idx, item in enumerate(selected, start=1):
-        nombre = str(item.get("nombre") or "No disponible").strip()
-        tipo = str(item.get("tipo") or "No disponible").strip()
-        horario_resumen = str(item.get("horario_resumen") or "No disponible").strip()
-        salon = item.get("salon_principal") if isinstance(item.get("salon_principal"), dict) else {}
-        salon_cod = str(salon.get("nomenclatura") or "Sin salón principal").strip()
-
-        lines.append(
-            f"{idx}. {nombre} ({tipo}). Salón principal: {salon_cod}. "
-            f"Horario: {horario_resumen}."
-        )
-
-    lines.append("Si me indicas el nombre exacto, te doy el detalle completo de esa persona.")
-    return "\n".join(lines)
-
-
-def _run_operational_tools(question: str) -> dict[str, str]:
-    salones_payload: dict[str, Any] = {"matches": []}
-    usuarios_payload: dict[str, Any] = {"matches": []}
-    agenda_payload: dict[str, Any] = {"matches": []}
-
-    try:
-        salones_raw = buscar_salones_idit.invoke(
-            {
-                "query": question,
-                "max_matches": TOOL_MAX_MATCHES,
-                "include_schedule": True,
-            }
-        )
-        salones_payload = json.loads(salones_raw) if isinstance(salones_raw, str) else {}
-    except Exception:
-        salones_payload = {"matches": []}
-
-    try:
-        usuarios_raw = buscar_personal_idit.invoke(
-            {
-                "query": question,
-                "max_matches": min(TOOL_MAX_MATCHES, 4),
-                "include_schedule": True,
-            }
-        )
-        usuarios_payload = json.loads(usuarios_raw) if isinstance(usuarios_raw, str) else {}
-    except Exception:
-        usuarios_payload = {"matches": []}
-
-    try:
-        agenda_raw = obtener_agenda_personal_idit.invoke(
-            {
-                "query": question,
-                "max_matches": min(TOOL_MAX_MATCHES, 3),
-                "include_details": True,
-            }
-        )
-        agenda_payload = json.loads(agenda_raw) if isinstance(agenda_raw, str) else {}
-    except Exception:
-        agenda_payload = {"matches": []}
-
-    direct_response = _build_personal_agenda_response(question, agenda_payload)
-    if not direct_response:
-        direct_response = _build_exact_salon_response(question, salones_payload)
-    if not direct_response:
-        direct_response = _build_multi_match_salon_response(question, salones_payload)
-
-    tool_context_text = (
-        "TOOLS_OPERATIVAS_IDIT\n"
-        "salones_tool_json=\n"
-        f"{_safe_json_with_budget(salones_payload, max_chars=4200)}\n"
-        "personal_tool_json=\n"
-        f"{_safe_json_with_budget(usuarios_payload, max_chars=2200)}\n"
-        "agenda_personal_tool_json=\n"
-        f"{_safe_json_with_budget(agenda_payload, max_chars=3000)}"
-    )
-
-    return {
-        "direct_response": direct_response,
-        "context_text": tool_context_text,
-    }
-
-
-def _registered_tools() -> list[Any]:
-    return [buscar_salones_idit, buscar_personal_idit, obtener_agenda_personal_idit]
-
-
-def _tool_map() -> dict[str, Any]:
-    return {
-        "buscar_salones_idit": buscar_salones_idit,
-        "buscar_personal_idit": buscar_personal_idit,
-        "obtener_agenda_personal_idit": obtener_agenda_personal_idit,
-    }
-
-
-def _safe_parse_tool_json(text: str) -> dict[str, Any]:
-    if not isinstance(text, str) or not text.strip():
-        return {}
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _build_direct_response_from_payloads(question: str, payloads: dict[str, dict[str, Any]]) -> str:
-    agenda_payload = payloads.get("obtener_agenda_personal_idit", {})
-    agenda_response = _build_personal_agenda_response(question, agenda_payload)
-    if agenda_response:
-        return agenda_response
-
-    salones_payload = payloads.get("buscar_salones_idit", {})
-    exact_response = _build_exact_salon_response(question, salones_payload)
-    if exact_response:
-        return exact_response
-
-    multi_response = _build_multi_match_salon_response(question, salones_payload)
-    if multi_response:
-        return multi_response
-
-    return ""
-
-
-def _build_tools_context_from_payloads(payloads: dict[str, dict[str, Any]]) -> str:
-    salones_payload = payloads.get("buscar_salones_idit", {"matches": []})
-    personal_payload = payloads.get("buscar_personal_idit", {"matches": []})
-    agenda_payload = payloads.get("obtener_agenda_personal_idit", {"matches": []})
-
-    return (
-        "TOOLS_OPERATIVAS_IDIT\n"
-        "salones_tool_json=\n"
-        f"{_safe_json_with_budget(salones_payload, max_chars=4200)}\n"
-        "personal_tool_json=\n"
-        f"{_safe_json_with_budget(personal_payload, max_chars=2200)}\n"
-        "agenda_personal_tool_json=\n"
-        f"{_safe_json_with_budget(agenda_payload, max_chars=3000)}"
-    )
-
-
-def _is_operational_question(question: str) -> bool:
-    return _question_needs_salon_disambiguation(question) or _question_requests_personal_info(question)
-
-
-def _execute_tool_calls_react(
-    model_with_tools: Any,
-    messages: list[Any],
-    max_rounds: int,
-) -> tuple[Any, dict[str, dict[str, Any]], list[Any]]:
-    payloads: dict[str, dict[str, Any]] = {}
-    current_messages = list(messages)
-    tool_lookup = _tool_map()
-
-    response = model_with_tools.invoke(current_messages)
-    rounds = 0
-
-    while rounds < max_rounds and getattr(response, "tool_calls", None):
-        current_messages.append(response)
-
-        for tool_call in response.tool_calls:
-            tool_name = str(tool_call.get("name") or "")
-            tool_args = tool_call.get("args") or {}
-            tool_id = str(tool_call.get("id") or "")
-
-            if tool_name not in tool_lookup:
-                result_text = f"Tool {tool_name} no encontrada"
-            else:
-                try:
-                    result = tool_lookup[tool_name].invoke(tool_args)
-                    result_text = str(result)
-                except Exception as exc:
-                    result_text = f"Error ejecutando {tool_name}: {exc}"
-
-            parsed_payload = _safe_parse_tool_json(result_text)
-            if parsed_payload:
-                payloads[tool_name] = parsed_payload
-
-            if tool_id:
-                current_messages.append(ToolMessage(content=result_text, tool_call_id=tool_id))
-
-        response = model_with_tools.invoke(current_messages)
-        rounds += 1
-
-    return response, payloads, current_messages
-
-
-def _compact_frontend_context(frontend_context: str | None, *, max_chars: int = 1500) -> str:
-    """Compacta contexto opcional del frontend para no inflar tokens."""
-    if not frontend_context:
-        return ""
-
-    compact = " ".join(str(frontend_context).split())
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    chroma_context: str
+    firebase_context: str
+    question: str
+
+
+def _truncate_history_text(text: str, max_chars: int = 350) -> str:
+    compact = " ".join(str(text or "").split())
     if len(compact) <= max_chars:
         return compact
     return f"{compact[: max_chars - 3]}..."
 
 
-def _clip_text_block(text: str | None, *, max_chars: int) -> str:
-    if not text:
-        return ""
-    compact = " ".join(str(text).split())
-    if len(compact) <= max_chars:
-        return compact
-    return f"{compact[: max_chars - 3]}..."
+def _history_to_messages(historial: list[dict]) -> list[BaseMessage]:
+    messages: list[BaseMessage] = []
+    for turno in historial[-4:]:
+        pregunta_hist = _truncate_history_text(str(turno.get("pregunta") or ""), max_chars=350)
+        respuesta_hist = _truncate_history_text(str(turno.get("respuesta") or ""), max_chars=350)
+        if pregunta_hist:
+            messages.append(HumanMessage(content=pregunta_hist))
+        if respuesta_hist:
+            messages.append(AIMessage(content=respuesta_hist))
+    return messages
+
+
+def build_graph(vector_store: Chroma, frontend_context: str | None = None):
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
+    tools = [buscar_salones_idit, buscar_personal_idit, obtener_agenda_personal_idit]
+    model_with_tools = llm.bind_tools(tools)
+    tool_node = ToolNode(tools)
+
+    def retrieve_context(state: AgentState) -> dict[str, Any]:
+        question = str(state.get("question") or "").strip()
+
+        resultados = vector_store.similarity_search(question, k=3)
+        contexto_chroma: list[str] = []
+        for doc in resultados:
+            fuente = doc.metadata.get("fuente", "desconocida")
+            categoria = doc.metadata.get("categoria", "general")
+            contexto_chroma.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
+
+        chroma_context = "\n\n---\n\n".join(contexto_chroma) if contexto_chroma else "Sin contexto Chroma"
+
+        firebase_runtime = build_firebase_runtime_context(
+            question,
+            frontend_context=frontend_context,
+        )
+        firebase_context = str(firebase_runtime.get("context_text") or "Sin datos operativos")
+
+        context_block = (
+            "[CONTEXTO INSTITUCIONAL]\n"
+            f"{chroma_context}\n\n"
+            "[DATOS OPERATIVOS EN VIVO]\n"
+            f"{firebase_context}\n\n"
+            "[PREGUNTA]\n"
+            f"{question}"
+        )
+
+        return {
+            "chroma_context": chroma_context,
+            "firebase_context": firebase_context,
+            "messages": [HumanMessage(content=context_block)],
+        }
+
+    def agent(state: AgentState) -> dict[str, Any]:
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    def should_continue(state: AgentState) -> str:
+        messages = state.get("messages") or []
+        if not messages:
+            return "end"
+
+        last_message = messages[-1]
+        if isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None):
+            return "tools"
+
+        return "end"
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("retrieve_context", retrieve_context)
+    workflow.add_node("agent", agent)
+    workflow.add_node("tools", tool_node)
+
+    workflow.set_entry_point("retrieve_context")
+    workflow.add_edge("retrieve_context", "agent")
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "end": END,
+        },
+    )
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile()
 
 
 def _sanitize_user_facing_response(text: str) -> str:
@@ -1261,101 +1169,52 @@ def generar_respuesta_rag(
     historial: list[dict],
     frontend_context: str | None = None,
 ) -> str:
-    """Responde con RAG hibrido usando ReAct con tools (salones/personal/agenda)."""
-    resultados = vector_store.similarity_search(pregunta, k=3)
+    """Responde con RAG usando un flujo de estado en LangGraph."""
+    graph = build_graph(vector_store, frontend_context=frontend_context)
+    initial_state: AgentState = {
+        "messages": _history_to_messages(historial),
+        "chroma_context": "",
+        "firebase_context": "",
+        "question": pregunta,
+    }
 
-    contexto_chroma = []
-    for doc in resultados:
-        fuente = doc.metadata.get("fuente", "desconocida")
-        categoria = doc.metadata.get("categoria", "general")
-        contexto_chroma.append(f"[Fuente: {fuente} | Categoría: {categoria}]\n{doc.page_content}")
+    if AGENT_DEBUG_TRACE:
+        config = RunnableConfig(callbacks=[ConsoleCallbackHandler()])
+        final_state = graph.invoke(initial_state, config=config, debug=True)
+    else:
+        final_state = graph.invoke(initial_state)
 
-    firebase_context = build_firebase_runtime_context(
-        pregunta,
-        frontend_context=frontend_context,
-    )
+    messages = final_state.get("messages") if isinstance(final_state, dict) else []
+    final_text = ""
 
-    contexto_firebase = firebase_context.get("context_text", "")
-    frontend_context_txt = _compact_frontend_context(frontend_context)
-    solicitud_horario = bool(firebase_context.get("schedule_requested", False))
-    solicitud_horario_detallado = bool(firebase_context.get("schedule_details_requested", False))
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if not isinstance(message, AIMessage):
+                continue
 
-    contexto_chroma_raw = "\n\n---\n\n".join(contexto_chroma) if contexto_chroma else "Sin contexto Chroma"
-    contexto_chroma_txt = _clip_text_block(contexto_chroma_raw, max_chars=2200) or "Sin contexto Chroma"
-    contexto_firebase_txt = _clip_text_block(contexto_firebase, max_chars=3200) or "Sin datos operativos"
-    contexto_frontend_raw = frontend_context_txt if frontend_context_txt else "Sin contexto frontend"
-    contexto_frontend_txt = _clip_text_block(contexto_frontend_raw, max_chars=900) or "Sin contexto frontend"
+            content = getattr(message, "content", "")
+            if isinstance(content, str):
+                final_text = content.strip()
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for part in content:
+                    if isinstance(part, str) and part.strip():
+                        parts.append(part.strip())
+                    elif isinstance(part, dict):
+                        text_part = str(part.get("text") or "").strip()
+                        if text_part:
+                            parts.append(text_part)
+                final_text = " ".join(parts).strip()
+            else:
+                final_text = str(content).strip()
 
-    react_system_prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        "Modo agente con tools:\n"
-        "- Para consultas de salones, horarios, ubicaciones, personal academico, calendario, citas o notificaciones, usa tools antes de responder.\n"
-        "- Tools disponibles: buscar_salones_idit, buscar_personal_idit, obtener_agenda_personal_idit.\n"
-        "- Si hay varias coincidencias de un mismo salon/servicio, enumera las opciones para evitar ambiguedad.\n"
-        "- Si no hay datos suficientes, responde exactamente: 'No tengo esa información disponible.'\n"
-        "- Entrega solo el mensaje final para usuario; no muestres razonamiento interno ni pasos de tool-calling."
-    )
+            if final_text:
+                break
 
-    pregunta_contextual = (
-        "Contexto de apoyo para responder:\n"
-        f"solicitud_horario={str(solicitud_horario).lower()}\n"
-        f"solicitud_horario_detallado={str(solicitud_horario_detallado).lower()}\n\n"
-        f"Contexto Chroma:\n{contexto_chroma_txt}\n\n"
-        f"Datos operativos (salones/personal):\n{contexto_firebase_txt}\n\n"
-        f"Contexto SIIS frontend:\n{contexto_frontend_txt}\n\n"
-        f"Pregunta del usuario: {pregunta}"
-    )
+    if not final_text:
+        return "No tengo esa información disponible."
 
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
-    model_with_tools = llm.bind_tools(_registered_tools())
-
-    messages: list[Any] = [SystemMessage(content=react_system_prompt)]
-    for turno in historial[-3:]:
-        pregunta_hist = str(turno.get("pregunta") or "").strip()
-        respuesta_hist = str(turno.get("respuesta") or "").strip()
-        if pregunta_hist:
-            messages.append(HumanMessage(content=_clip_text_block(pregunta_hist, max_chars=280) or pregunta_hist))
-        if respuesta_hist:
-            messages.append(AIMessage(content=_clip_text_block(respuesta_hist, max_chars=500) or respuesta_hist))
-    messages.append(HumanMessage(content=pregunta_contextual))
-
-    respuesta, tool_payloads, _ = _execute_tool_calls_react(
-        model_with_tools=model_with_tools,
-        messages=messages,
-        max_rounds=max(1, TOOL_MAX_ROUNDS),
-    )
-
-    direct_tool_response = _build_direct_response_from_payloads(pregunta, tool_payloads)
-    if direct_tool_response:
-        return _sanitize_user_facing_response(direct_tool_response)
-
-    contexto_tools = _build_tools_context_from_payloads(tool_payloads) if tool_payloads else ""
-
-    if _is_operational_question(pregunta) and not tool_payloads:
-        fallback_tools = _run_operational_tools(pregunta)
-        fallback_direct = str(fallback_tools.get("direct_response") or "").strip()
-        if fallback_direct:
-            return _sanitize_user_facing_response(fallback_direct)
-        contexto_tools = str(fallback_tools.get("context_text") or "").strip()
-
-    contenido = getattr(respuesta, "content", "")
-    if isinstance(contenido, str) and contenido.strip():
-        return _sanitize_user_facing_response(contenido)
-
-    if contexto_tools:
-        rescue_prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            "Genera una respuesta final clara y concisa para el usuario con el contexto siguiente. "
-            "No expliques herramientas internas.\n\n"
-            f"{contexto_tools}\n\n"
-            f"Pregunta: {pregunta}"
-        )
-        rescue_response = llm.invoke(rescue_prompt)
-        rescue_content = getattr(rescue_response, "content", "")
-        if isinstance(rescue_content, str) and rescue_content.strip():
-            return _sanitize_user_facing_response(rescue_content)
-
-    return "No tengo esa información disponible."
+    return _sanitize_user_facing_response(final_text)
 
 
 def chat_loop(vector_store: Chroma):
