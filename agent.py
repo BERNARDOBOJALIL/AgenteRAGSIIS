@@ -29,8 +29,6 @@ CHROMA_DATABASE = os.getenv("CHROMA_DATABASE")
 CHROMA_API_KEY = os.getenv("CHROMA_API_KEY")
 CHROMA_CLOUD_HOST = os.getenv("CHROMA_CLOUD_HOST", "api.trychroma.com")
 CHROMA_CLOUD_PORT = int(os.getenv("CHROMA_CLOUD_PORT", "443"))
-TOOL_MAX_MATCHES = int(os.getenv("AGENT_TOOL_MAX_MATCHES", "6"))
-TOOL_MAX_ROUNDS = int(os.getenv("AGENT_TOOL_MAX_ROUNDS", "3"))
 AGENT_DEBUG_TRACE = os.getenv("AGENT_DEBUG_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 SALON_CODE_PATTERN = re.compile(r"\bj[\s_-]?\d{1,3}(?:-[a-z])?\b", flags=re.IGNORECASE)
 SALON_CODE_LOOSE_PATTERN = re.compile(r"\bj[\s_-]?(\d{1,3})(?:[\s_-]?([a-z]))?\b", flags=re.IGNORECASE)
@@ -52,58 +50,8 @@ HORARIO_CLASS_NAME_KEYS = (
 )
 HORARIO_GROUP_KEYS = ("grupo", "grupos", "seccion", "secciones")
 HORARIO_TEACHER_KEYS = ("profesor", "docente", "maestro")
-SALON_SHORT_QUERY_TOKENS = {"ia", "ai", "ar", "ra", "vr", "ml", "xr", "3d", "ti", "ux", "ui"}
-SALON_TERM_EXPANSIONS: dict[str, tuple[str, ...]] = {
-    "ia": ("inteligencia", "artificial"),
-    "ai": ("inteligencia", "artificial"),
-    "ar": ("realidad", "aumentada"),
-    "ra": ("realidad", "aumentada"),
-    "vr": ("realidad", "virtual"),
-    "ml": ("machine", "learning", "aprendizaje"),
-    "fablab": ("fabricacion", "digital"),
-    "labs": ("laboratorio",),
-    "lab": ("laboratorio",),
-}
-SALON_PHRASE_HINTS: dict[str, tuple[str, ...]] = {
-    "ia": ("inteligencia artificial",),
-    "ai": ("inteligencia artificial",),
-    "ar": ("realidad aumentada",),
-    "ra": ("realidad aumentada",),
-    "vr": ("realidad virtual",),
-    "ml": ("machine learning", "aprendizaje automatico"),
-}
-SALON_GENERIC_TERMS = {
-    "salon",
-    "salones",
-    "laboratorio",
-    "laboratorios",
-    "aula",
-    "aulas",
-    "proyecto",
-    "proyectos",
-    "espacio",
-    "espacios",
-}
-SALON_HIGH_SIGNAL_TERMS = {
-    "ia",
-    "ai",
-    "ar",
-    "ra",
-    "vr",
-    "ml",
-    "xr",
-    "3d",
-    "inteligencia",
-    "artificial",
-    "biometrica",
-    "neuromarketing",
-    "robotica",
-    "aumentada",
-    "virtual",
-    "fabrica",
-    "fabricacion",
-    "digital",
-}
+SALON_FUZZY_MIN_RATIO = 0.58
+SALON_RELAXED_FUZZY_MIN_RATIO = 0.42
 
 agent_log = logging.getLogger(__name__)
 
@@ -127,9 +75,11 @@ Uso de tools:
 - Para preguntas sobre información general e institucional del IDIT (qué es el IDIT, servicios disponibles,
   tecnologías, áreas, programas académicos, descripción de laboratorios), usa buscar_informacion_idit.
 - Nunca respondas preguntas sobre equipos o información institucional sin consultar primero las tools correspondientes.
-- Para consultas de salones con nomenclatura/codigo (ejemplo J003, J-003), si buscar_salones_idit devuelve
-    total_matches=0 debes reintentar con una reformulación antes de cerrar respuesta.
-- Si después de los intentos sigue total_matches=0, explica qué attempted_queries se intentaron.
+- El agente decide qué tool usar según la intención de la pregunta y el contexto disponible, no por listas rígidas de palabras.
+- Para consultas de salones, usa buscar_salones_idit y considera tanto coincidencias exactas como aproximadas.
+- Cuando buscar_salones_idit regrese similarity y match_confidence, prioriza los resultados con mayor similarity.
+- Si no hay coincidencia exacta pero sí candidatos de confidence media o baja, ofrece el mejor candidato y pide confirmación.
+- Integra siempre la información de las tools con el contexto operativo disponible para dar la mejor respuesta posible.
 """
 
 
@@ -137,6 +87,12 @@ def _normalize_lookup_text(value: Any) -> str:
     text = str(value or "").strip().lower()
     normalized = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _normalize_compact_text(value: Any) -> str:
+    """Normaliza y compacta texto para comparar variantes con/ sin separadores."""
+    normalized = _normalize_lookup_text(value)
+    return re.sub(r"[^a-z0-9]+", "", normalized)
 
 
 def _emit_structured_debug(event: str, **payload: Any) -> None:
@@ -200,7 +156,7 @@ def _normalize_salon_codes_in_text(value: Any) -> str:
 
 
 def _build_salon_query_variants(query: str) -> list[str]:
-    """Genera variantes de consulta para mejorar recall antes de rendirse."""
+    """Genera variantes ligeras de consulta sin expandir por listas de sinonimos."""
     base = str(query or "").strip()
     if not base:
         return []
@@ -223,15 +179,11 @@ def _build_salon_query_variants(query: str) -> list[str]:
 
     _add(base)
     _add(normalized_full)
-    _add(normalized_full.upper())
-    _add(normalized_full.lower())
+    _add(_normalize_lookup_text(normalized_full))
 
     if canonical_code:
         _add(canonical_code)
-        _add(canonical_code.lower())
         _add(canonical_code.replace("-", ""))
-        _add(canonical_code.replace("-", "").lower())
-        _add(f"nomenclatura {canonical_code}")
         _add(f"salon {canonical_code}")
 
     return variants
@@ -279,24 +231,32 @@ def _normalized_word_tokens(text: str) -> set[str]:
 
 
 def _contains_approx_term(tokens: set[str], term: str, min_ratio: float = 0.83) -> bool:
-    if not term or len(term) < 6 or not tokens:
+    if not term or len(term) < 4 or not tokens:
         return False
 
-    term_prefix = term[:6]
+    term_compact = _normalize_compact_text(term)
+    if len(term_compact) < 4:
+        return False
+
     for token in tokens:
-        if len(token) < 6:
+        token_compact = _normalize_compact_text(token)
+        if len(token_compact) < 4:
             continue
-        if abs(len(token) - len(term)) > 4:
+        if abs(len(token_compact) - len(term_compact)) > 4:
             continue
-        if token.startswith(term_prefix) or term.startswith(token[:6]):
+
+        if token_compact == term_compact:
             return True
-        if SequenceMatcher(None, token, term).ratio() >= min_ratio:
+        if token_compact in term_compact or term_compact in token_compact:
+            return True
+        if SequenceMatcher(None, token_compact, term_compact).ratio() >= min_ratio:
             return True
 
     return False
 
 
 def _expand_salon_query_terms(base_terms: set[str]) -> set[str]:
+    """Expande terminos solo con reglas morfologicas ligeras."""
     expanded: set[str] = set()
 
     for raw_term in base_terms:
@@ -305,30 +265,19 @@ def _expand_salon_query_terms(base_terms: set[str]) -> set[str]:
             continue
 
         expanded.add(term)
+        compact = _normalize_compact_text(term)
+        if compact:
+            expanded.add(compact)
 
         if term.endswith("es") and len(term) > 4:
             expanded.add(term[:-2])
         elif term.endswith("s") and len(term) > 4:
             expanded.add(term[:-1])
 
-        for extra in SALON_TERM_EXPANSIONS.get(term, ()): 
-            expanded.add(extra)
-
-    return expanded
-
-
-def _salon_phrase_hints_from_terms(base_terms: set[str]) -> set[str]:
-    hints: set[str] = set()
-    for raw_term in base_terms:
-        term = _normalize_lookup_text(raw_term)
-        for phrase in SALON_PHRASE_HINTS.get(term, ()): 
-            hints.add(phrase)
-    return hints
+    return {term for term in expanded if len(term) >= 3}
 
 
 def _salon_term_weight(term: str) -> int:
-    if term in SALON_HIGH_SIGNAL_TERMS:
-        return 6
     if len(term) >= 11:
         return 5
     if len(term) >= 8:
@@ -350,6 +299,10 @@ def _score_salon_item_detailed(
     nomen_norm = _normalize_lookup_text(nomenclatura)
     nombre_norm = _normalize_lookup_text(nombre)
     tipo_norm = _normalize_lookup_text(data.get("tipo"))
+    nomen_compact = _normalize_compact_text(nomen_norm)
+    nombre_compact = _normalize_compact_text(nombre_norm)
+    tipo_compact = _normalize_compact_text(tipo_norm)
+    normalized_query_compact = _normalize_compact_text(normalized_query)
 
     blob_parts = [
         nomen_norm,
@@ -362,24 +315,26 @@ def _score_salon_item_detailed(
         " ".join(_normalize_lookup_text(name) for name in _extract_responsable_names(data.get("responsables"), max_items=8)),
     ]
     blob = " ".join(part for part in blob_parts if part)
+    blob_compact = _normalize_compact_text(blob)
     nomen_tokens = _normalized_word_tokens(nomen_norm)
     nombre_tokens = _normalized_word_tokens(nombre_norm)
     tipo_tokens = _normalized_word_tokens(tipo_norm)
     blob_tokens = _normalized_word_tokens(blob)
+    if nomen_compact:
+        nomen_tokens.add(nomen_compact)
+    if nombre_compact:
+        nombre_tokens.add(nombre_compact)
+    if tipo_compact:
+        tipo_tokens.add(tipo_compact)
+    if blob_compact:
+        blob_tokens.add(blob_compact)
 
-    short_terms = {
-        tok
-        for tok in re.split(r"[^a-z0-9]+", normalized_query)
-        if len(tok) == 2 and tok in SALON_SHORT_QUERY_TOKENS
-    }
-    base_terms = {term for term in terms if term} | short_terms
+    base_terms = {term for term in terms if term}
     expanded_terms = _expand_salon_query_terms(base_terms)
-    phrase_hints = _salon_phrase_hints_from_terms(base_terms)
 
     score = 0
     score_components: dict[str, int] = {}
     matched_terms: set[str] = set()
-    matched_phrases: set[str] = set()
     field_hits = {"nomenclatura": 0, "nombre": 0, "tipo": 0, "blob": 0}
 
     def add_component(component: str, value: int) -> None:
@@ -392,12 +347,20 @@ def _score_salon_item_detailed(
     if normalized_query:
         if normalized_query in nomen_norm:
             add_component("exact_query_nomenclatura", 34)
+        elif normalized_query_compact and normalized_query_compact in nomen_compact:
+            add_component("exact_query_nomenclatura_compact", 28)
         if normalized_query in nombre_norm:
             add_component("exact_query_nombre", 22)
+        elif normalized_query_compact and normalized_query_compact in nombre_compact:
+            add_component("exact_query_nombre_compact", 20)
         if normalized_query in tipo_norm:
             add_component("exact_query_tipo", 16)
+        elif normalized_query_compact and normalized_query_compact in tipo_compact:
+            add_component("exact_query_tipo_compact", 14)
         elif normalized_query in blob:
             add_component("exact_query_blob", 7)
+        elif normalized_query_compact and normalized_query_compact in blob_compact:
+            add_component("exact_query_blob_compact", 6)
 
     code_match = SALON_CODE_PATTERN.search(normalized_query)
     if code_match:
@@ -408,22 +371,9 @@ def _score_salon_item_detailed(
         elif asked_code and asked_code in item_code:
             add_component("partial_code_match", 28)
 
-    for phrase in sorted(phrase_hints):
-        if phrase in nombre_norm:
-            add_component(f"phrase_nombre:{phrase}", 24)
-            matched_phrases.add(phrase)
-            field_hits["nombre"] += 1
-        elif phrase in tipo_norm:
-            add_component(f"phrase_tipo:{phrase}", 18)
-            matched_phrases.add(phrase)
-            field_hits["tipo"] += 1
-        elif phrase in blob:
-            add_component(f"phrase_blob:{phrase}", 9)
-            matched_phrases.add(phrase)
-            field_hits["blob"] += 1
-
     for term in sorted(expanded_terms):
         weight = _salon_term_weight(term)
+        term_compact = _normalize_compact_text(term)
         if _contains_term_with_boundaries(nomen_norm, term):
             add_component(f"term_nomenclatura:{term}", weight * 7)
             matched_terms.add(term)
@@ -438,6 +388,22 @@ def _score_salon_item_detailed(
             field_hits["tipo"] += 1
         elif _contains_term_with_boundaries(blob, term):
             add_component(f"term_blob:{term}", weight * 2)
+            matched_terms.add(term)
+            field_hits["blob"] += 1
+        elif term_compact and term_compact in nomen_compact:
+            add_component(f"term_nomenclatura_compact:{term}", weight * 6)
+            matched_terms.add(term)
+            field_hits["nomenclatura"] += 1
+        elif term_compact and term_compact in nombre_compact:
+            add_component(f"term_nombre_compact:{term}", weight * 5)
+            matched_terms.add(term)
+            field_hits["nombre"] += 1
+        elif term_compact and term_compact in tipo_compact:
+            add_component(f"term_tipo_compact:{term}", weight * 4)
+            matched_terms.add(term)
+            field_hits["tipo"] += 1
+        elif term_compact and term_compact in blob_compact:
+            add_component(f"term_blob_compact:{term}", weight * 2)
             matched_terms.add(term)
             field_hits["blob"] += 1
         elif _contains_approx_term(nomen_tokens, term):
@@ -465,13 +431,6 @@ def _score_salon_item_detailed(
     if len(matched_terms) >= 3:
         add_component("multi_term_bonus", 8)
 
-    if matched_phrases and len(matched_terms) >= 2:
-        add_component("phrase_alignment_bonus", 10)
-
-    specific_terms = [term for term in matched_terms if term not in SALON_GENERIC_TERMS]
-    if matched_terms and not specific_terms:
-        add_component("generic_match_penalty", -4)
-
     if score < 0:
         score = 0
 
@@ -480,13 +439,36 @@ def _score_salon_item_detailed(
         for name, value in sorted(score_components.items(), key=lambda pair: abs(pair[1]), reverse=True)[:8]
     ]
 
+    best_term_similarity = 0.0
+    token_pool = nomen_tokens | nombre_tokens | tipo_tokens | blob_tokens
+    for term in expanded_terms:
+        term_compact = _normalize_compact_text(term)
+        if len(term_compact) < 3:
+            continue
+        for token in token_pool:
+            token_compact = _normalize_compact_text(token)
+            if len(token_compact) < 3:
+                continue
+            if token_compact == term_compact:
+                best_term_similarity = max(best_term_similarity, 1.0)
+                continue
+            ratio = SequenceMatcher(None, token_compact, term_compact).ratio()
+            if ratio > best_term_similarity:
+                best_term_similarity = ratio
+
+    score_similarity = min(1.0, max(0.0, score / 180.0))
+    coverage_strength = coverage_ratio * min(1.0, len(expanded_terms) / 3.0) if expanded_terms else 0.0
+    term_alignment = min(0.9, best_term_similarity * 0.9)
+    similarity = round(min(1.0, max(score_similarity, coverage_strength, term_alignment)), 3)
+
     details: dict[str, Any] = {
         "base_terms": sorted(base_terms),
         "expanded_terms": sorted(expanded_terms),
         "matched_terms": sorted(matched_terms),
-        "matched_phrases": sorted(matched_phrases),
+        "matched_phrases": [],
         "coverage_ratio": round(coverage_ratio, 3),
-        "specific_terms_matched": len(specific_terms),
+        "similarity": similarity,
+        "specific_terms_matched": len(matched_terms),
         "field_hits": field_hits,
         "top_score_components": top_components,
     }
@@ -831,6 +813,29 @@ def _safe_json_with_budget(payload: Any, max_chars: int) -> str:
     return json.dumps({"truncated": True}, ensure_ascii=False, separators=(",", ":"))
 
 
+def _resolve_match_similarity(score: int, score_debug: dict[str, Any] | None) -> float:
+    details = score_debug if isinstance(score_debug, dict) else {}
+
+    explicit_similarity = details.get("similarity")
+    if isinstance(explicit_similarity, (int, float)):
+        return round(max(0.0, min(1.0, float(explicit_similarity))), 3)
+
+    coverage = details.get("coverage_ratio")
+    coverage_ratio = float(coverage) if isinstance(coverage, (int, float)) else 0.0
+    score_ratio = max(0.0, min(1.0, float(score) / 180.0))
+    return round(min(1.0, (score_ratio * 0.75) + (coverage_ratio * 0.25)), 3)
+
+
+def _label_match_confidence(similarity: float) -> str:
+    if similarity >= 0.8:
+        return "alta"
+    if similarity >= 0.55:
+        return "media"
+    if similarity >= 0.35:
+        return "baja"
+    return "muy_baja"
+
+
 def _serialize_salon_for_tool(item: dict[str, Any], score: int, include_schedule: bool) -> dict[str, Any]:
     data = item.get("data") if isinstance(item.get("data"), dict) else {}
     horario = data.get("horario")
@@ -981,10 +986,11 @@ def _fallback_match_salones_by_fields(
 ) -> tuple[list[tuple[int, dict[str, Any], dict[str, Any]]], str]:
     """Fallback robusto cuando el scoring principal devuelve 0 resultados."""
     normalized_variant = _normalize_lookup_text(_normalize_salon_codes_in_text(query_variant))
+    normalized_variant_compact = _normalize_compact_text(normalized_variant)
     canonical_code = _canonicalize_salon_code(query_variant)
     normalized_code = _normalize_salon_code(canonical_code or query_variant)
 
-    if not normalized_variant and not normalized_code:
+    if not normalized_variant and not normalized_variant_compact and not normalized_code:
         return [], "empty_variant"
 
     field_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
@@ -1000,6 +1006,9 @@ def _fallback_match_salones_by_fields(
         nomen_norm = _normalize_lookup_text(nomen)
         nombre_norm = _normalize_lookup_text(nombre)
         id_conjunto_norm = _normalize_lookup_text(id_conjunto)
+        nomen_compact = _normalize_compact_text(nomen_norm)
+        nombre_compact = _normalize_compact_text(nombre_norm)
+        id_conjunto_compact = _normalize_compact_text(id_conjunto_norm)
         nomen_code_norm = _normalize_salon_code(nomen)
 
         score = 0
@@ -1012,20 +1021,35 @@ def _fallback_match_salones_by_fields(
         if normalized_variant and normalized_variant == nomen_norm:
             score += 120
             reasons.append("exact_nomenclatura_text")
+        elif normalized_variant_compact and normalized_variant_compact == nomen_compact:
+            score += 115
+            reasons.append("exact_nomenclatura_compact")
         elif normalized_variant and normalized_variant in nomen_norm:
             score += 65
             reasons.append("partial_nomenclatura_text")
+        elif normalized_variant_compact and normalized_variant_compact in nomen_compact:
+            score += 62
+            reasons.append("partial_nomenclatura_compact")
 
         if normalized_variant and normalized_variant == nombre_norm:
             score += 95
             reasons.append("exact_nombre")
+        elif normalized_variant_compact and normalized_variant_compact == nombre_compact:
+            score += 90
+            reasons.append("exact_nombre_compact")
         elif normalized_variant and normalized_variant in nombre_norm:
             score += 55
             reasons.append("partial_nombre")
+        elif normalized_variant_compact and normalized_variant_compact in nombre_compact:
+            score += 50
+            reasons.append("partial_nombre_compact")
 
         if normalized_variant and normalized_variant == id_conjunto_norm:
             score += 70
             reasons.append("exact_idConjunto")
+        elif normalized_variant_compact and normalized_variant_compact == id_conjunto_compact:
+            score += 65
+            reasons.append("exact_idConjunto_compact")
 
         if score <= 0:
             continue
@@ -1037,6 +1061,7 @@ def _fallback_match_salones_by_fields(
                 {
                     "fallback_mode": "field_match",
                     "reasons": reasons,
+                    "similarity": round(min(0.99, score / 220.0), 4),
                 },
             )
         )
@@ -1046,7 +1071,8 @@ def _fallback_match_salones_by_fields(
         return field_matches, "field_match"
 
     fuzzy_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
-    if not normalized_variant:
+    relaxed_fuzzy_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    if not normalized_variant and not normalized_variant_compact:
         return [], "no_fuzzy_input"
 
     for item in salones:
@@ -1059,35 +1085,66 @@ def _fallback_match_salones_by_fields(
             "nombre": _normalize_lookup_text(data.get("nombre") or ""),
             "idConjunto": _normalize_lookup_text(data.get("idConjunto") or ""),
         }
+        fields_compact: dict[str, str] = {key: _normalize_compact_text(value) for key, value in fields.items()}
 
         best_field = ""
         best_ratio = 0.0
         for field_name, field_value in fields.items():
-            if not field_value:
+            field_compact = fields_compact.get(field_name, "")
+            if not field_value and not field_compact:
                 continue
-            ratio = SequenceMatcher(None, normalized_variant, field_value).ratio()
+            ratio_norm = (
+                SequenceMatcher(None, normalized_variant, field_value).ratio()
+                if normalized_variant and field_value
+                else 0.0
+            )
+            ratio_compact = (
+                SequenceMatcher(None, normalized_variant_compact, field_compact).ratio()
+                if normalized_variant_compact and field_compact
+                else 0.0
+            )
+            ratio = max(ratio_norm, ratio_compact)
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_field = field_name
 
-        if best_ratio < 0.72:
-            continue
-
         score = int(round(best_ratio * 90))
-        fuzzy_matches.append(
-            (
-                score,
-                item,
-                {
-                    "fallback_mode": "fuzzy_match",
-                    "best_field": best_field,
-                    "similarity": round(best_ratio, 4),
-                },
-            )
+        payload = (
+            score,
+            item,
+            {
+                "fallback_mode": "fuzzy_match",
+                "best_field": best_field,
+                "similarity": round(best_ratio, 4),
+                "threshold": SALON_FUZZY_MIN_RATIO,
+            },
         )
 
+        if best_ratio >= SALON_FUZZY_MIN_RATIO:
+            fuzzy_matches.append(payload)
+        elif best_ratio >= SALON_RELAXED_FUZZY_MIN_RATIO:
+            relaxed_fuzzy_matches.append(
+                (
+                    score,
+                    item,
+                    {
+                        "fallback_mode": "fuzzy_relaxed",
+                        "best_field": best_field,
+                        "similarity": round(best_ratio, 4),
+                        "threshold": SALON_RELAXED_FUZZY_MIN_RATIO,
+                    },
+                )
+            )
+
     fuzzy_matches.sort(key=lambda pair: pair[0], reverse=True)
-    return fuzzy_matches, "fuzzy_match"
+    if fuzzy_matches:
+        return fuzzy_matches, "fuzzy_match"
+
+    relaxed_fuzzy_matches.sort(key=lambda pair: pair[0], reverse=True)
+    if relaxed_fuzzy_matches:
+        return relaxed_fuzzy_matches[:12], "fuzzy_relaxed"
+
+    return [], "no_match"
 
 
 @tool("buscar_salones_idit")
@@ -1096,7 +1153,8 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
 
     Usa esta tool cuando la consulta del usuario trate de ubicacion de salones,
     clases y horarios, disponibilidad, responsables o equipamiento de espacios del IDIT
-    (por ejemplo FABLAB, laboratorios o codigos tipo J-001-A).
+    (por ejemplo FABLAB, laboratorios o codigos tipo J-001-A, J001, j001, J-001,j-).
+    Si no ecnuentras el codigo o resultado exacto regresa el que tenga mayor coincidencia.
 
     Args:
         query: Consulta libre del usuario en espanol. Puede incluir nombre de servicio,
@@ -1182,9 +1240,35 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
         reverse=True,
     )[:limit]
 
+    if not selected and salones:
+        rescue_scored, rescue_mode = _fallback_match_salones_by_fields(salones, query)
+        for score, item, score_debug in rescue_scored[: max(limit * 2, 12)]:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            doc_id = str(item.get("doc_id") or data.get("nomenclatura") or "").strip()
+            if not doc_id:
+                continue
+            enriched_debug = dict(score_debug or {})
+            enriched_debug["matched_by_query"] = query
+            enriched_debug["search_mode"] = rescue_mode
+            best_by_doc[doc_id] = (score, item, enriched_debug, query)
+
+        selected = sorted(
+            best_by_doc.values(),
+            key=lambda entry: (
+                entry[0],
+                float(entry[2].get("coverage_ratio") or 0.0),
+                int(entry[2].get("specific_terms_matched") or 0),
+            ),
+            reverse=True,
+        )[:limit]
+
     matches_payload: list[dict[str, Any]] = []
     for score, item, score_debug, matched_query in selected:
         serialized = _serialize_salon_for_tool(item, score, include_schedule=include_schedule)
+        similarity = _resolve_match_similarity(score, score_debug)
+        serialized["similarity"] = similarity
+        serialized["match_confidence"] = _label_match_confidence(similarity)
+        serialized["search_mode"] = str(score_debug.get("search_mode") or "score")
         serialized["matched_query"] = matched_query
         if AGENT_DEBUG_TRACE:
             serialized["score_debug"] = {
@@ -1353,7 +1437,6 @@ class AgentState(TypedDict):
     firebase_context: str
     question: str
     original_question: str
-    salon_retry_count: int
     debug_trace: dict[str, Any]
 
 
@@ -1501,161 +1584,8 @@ def _append_graph_event(debug_trace: dict[str, Any], event: str, **payload: Any)
     return updated
 
 
-def _safe_parse_tool_payload(content: Any) -> dict[str, Any]:
-    if isinstance(content, dict):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, str) and part.strip():
-                parts.append(part.strip())
-            elif isinstance(part, dict):
-                text_part = str(part.get("text") or "").strip()
-                if text_part:
-                    parts.append(text_part)
-        if parts:
-            content = " ".join(parts)
-    if isinstance(content, str):
-        raw = content.strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _latest_tool_payload(messages: list[BaseMessage], tool_name: str) -> dict[str, Any]:
-    for message in reversed(messages):
-        if isinstance(message, ToolMessage) and str(getattr(message, "name", "") or "") == tool_name:
-            return _safe_parse_tool_payload(getattr(message, "content", ""))
-    return {}
-
-
-def _collect_salones_attempted_queries(messages: list[BaseMessage]) -> list[str]:
-    attempts: list[str] = []
-    seen: set[str] = set()
-
-    for message in messages:
-        if not isinstance(message, ToolMessage):
-            continue
-        if str(getattr(message, "name", "") or "") != "buscar_salones_idit":
-            continue
-
-        payload = _safe_parse_tool_payload(getattr(message, "content", ""))
-        for query in payload.get("attempted_queries") or []:
-            text = str(query or "").strip()
-            if not text:
-                continue
-            key = _normalize_lookup_text(text)
-            if key in seen:
-                continue
-            seen.add(key)
-            attempts.append(text)
-
-    return attempts
-
-
-def _looks_like_salon_question(question: str) -> bool:
-    normalized = _normalize_lookup_text(question)
-    if not normalized:
-        return False
-    if SALON_CODE_PATTERN.search(normalized):
-        return True
-
-    tokens = _tokenize_for_tool_search(question)
-    if not tokens:
-        return False
-    if tokens & SALON_GENERIC_TERMS:
-        return True
-    if tokens & SALON_HIGH_SIGNAL_TERMS:
-        return True
-    return any(token.startswith("j") and token[1:].isdigit() for token in tokens)
-
-
-def _build_retry_query(question: str, retry_count: int) -> str:
-    variants = _build_salon_query_variants(question)
-    if not variants:
-        return question
-
-    index = min(max(0, retry_count), len(variants) - 1)
-    return variants[index]
-
-
-def _payload_total_matches(payload: dict[str, Any]) -> int:
-    try:
-        return max(0, int(payload.get("total_matches") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _has_successful_salones_tool_result(messages: list[BaseMessage]) -> bool:
-    for message in messages:
-        if not isinstance(message, ToolMessage):
-            continue
-        if str(getattr(message, "name", "") or "") != "buscar_salones_idit":
-            continue
-        payload = _safe_parse_tool_payload(getattr(message, "content", ""))
-        if _payload_total_matches(payload) > 0:
-            return True
-    return False
-
-
-def _should_force_salon_retry(state: AgentState, max_retries: int) -> bool:
-    retry_count = int(state.get("salon_retry_count") or 0)
-    if retry_count >= max_retries:
-        return False
-
-    question = str(state.get("original_question") or state.get("question") or "")
-    if not _looks_like_salon_question(question):
-        return False
-
-    messages = state.get("messages") or []
-    if not isinstance(messages, list) or not messages:
-        return False
-
-    if _has_successful_salones_tool_result(messages):
-        return False
-
-    latest_payload = _latest_tool_payload(messages, "buscar_salones_idit")
-    if not latest_payload:
-        return False
-
-    latest_matches = _payload_total_matches(latest_payload)
-    if latest_matches > 0:
-        return False
-
-    return True
-
-
-def _build_attempts_explanation(question: str, messages: list[BaseMessage]) -> str:
-    if not _looks_like_salon_question(question):
-        return ""
-
-    attempted_queries = _collect_salones_attempted_queries(messages)
-    if not attempted_queries:
-        return ""
-
-    attempted_preview = ", ".join(attempted_queries[:8])
-    if len(attempted_queries) > 8:
-        attempted_preview += ", ..."
-
-    return (
-        "No encontré coincidencias para esa búsqueda de salón. "
-        f"Intenté estas consultas: {attempted_preview}. "
-        "Si quieres, puedo intentarlo con el nombre completo del laboratorio o con otra nomenclatura."
-    )
-
-
 def build_graph(vector_store: Chroma, frontend_context: str | None = None):
     llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
-    raw_retries = os.getenv("AGENT_FORCE_SALON_RETRIES", "2")
-    try:
-        max_forced_salon_retries = max(0, min(6, int(str(raw_retries).strip() or "2")))
-    except ValueError:
-        max_forced_salon_retries = 2
     
     # Definir tools de ChromaDB con closure sobre vector_store
     @tool("buscar_equipos_idit")
@@ -1865,41 +1795,6 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
             "debug_trace": debug_trace,
         }
 
-    def retry_salones(state: AgentState) -> dict[str, Any]:
-        retry_count = int(state.get("salon_retry_count") or 0)
-        question_base = str(state.get("question") or state.get("original_question") or "")
-        retry_query = _build_retry_query(question_base, retry_count + 1)
-
-        call_id = f"forced_salon_retry_{retry_count + 1}"
-        forced_tool_call = AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "id": call_id,
-                    "name": "buscar_salones_idit",
-                    "args": {
-                        "query": retry_query,
-                        "max_matches": max(6, TOOL_MAX_MATCHES),
-                        "include_schedule": True,
-                    },
-                    "type": "tool_call",
-                }
-            ],
-        )
-
-        debug_trace = _append_graph_event(
-            dict(state.get("debug_trace") or {}),
-            "forced_salon_retry",
-            retry_index=retry_count + 1,
-            retry_query=retry_query,
-        )
-
-        return {
-            "messages": [forced_tool_call],
-            "salon_retry_count": retry_count + 1,
-            "debug_trace": debug_trace,
-        }
-
     def should_continue(state: AgentState) -> str:
         messages = state.get("messages") or []
         if not messages:
@@ -1911,10 +1806,6 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
             _emit_structured_debug("graph.route", decision="tools", reason="model_tool_calls")
             return "tools"
 
-        if _should_force_salon_retry(state, max_retries=max_forced_salon_retries):
-            _emit_structured_debug("graph.route", decision="retry_salones", reason="empty_salones_result")
-            return "retry_salones"
-
         _emit_structured_debug("graph.route", decision="end", reason="no_tool_calls")
         return "end"
 
@@ -1922,7 +1813,6 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
     workflow.add_node("retrieve_context", retrieve_context)
     workflow.add_node("agent", agent)
     workflow.add_node("tools", tool_node)
-    workflow.add_node("retry_salones", retry_salones)
 
     workflow.set_entry_point("retrieve_context")
     workflow.add_edge("retrieve_context", "agent")
@@ -1931,11 +1821,9 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
         should_continue,
         {
             "tools": "tools",
-            "retry_salones": "retry_salones",
             "end": END,
         },
     )
-    workflow.add_edge("retry_salones", "tools")
     workflow.add_edge("tools", "agent")
 
     return workflow.compile()
@@ -2001,12 +1889,11 @@ def generar_respuesta_rag(
 
     graph = build_graph(vector_store, frontend_context=frontend_context)
     initial_state: AgentState = {
-        "messages": _history_to_messages(historial),
+        "messages": [SystemMessage(content=SYSTEM_PROMPT), *_history_to_messages(historial)],
         "chroma_context": "",
         "firebase_context": "",
         "question": pregunta_normalizada,
         "original_question": pregunta_original,
-        "salon_retry_count": 0,
         "debug_trace": {
             "question_original": pregunta_original,
             "question_normalized": pregunta_normalizada,
@@ -2047,11 +1934,6 @@ def generar_respuesta_rag(
 
     if not final_text:
         return "No tengo esa información disponible."
-
-    if isinstance(messages, list):
-        attempted_explanation = _build_attempts_explanation(pregunta_original, messages)
-        if attempted_explanation and not _has_successful_salones_tool_result(messages):
-            final_text = attempted_explanation
 
     if AGENT_DEBUG_TRACE and isinstance(final_state, dict):
         _print_pretty_debug_trace(
