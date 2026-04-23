@@ -10,19 +10,13 @@ import chromadb
 from dotenv import load_dotenv
 from firebase_sources import build_firebase_runtime_context, fetch_firebase_live_snapshot
 from langchain_chroma import Chroma
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-
-try:
-    from langchain_core.callbacks import ConsoleCallbackHandler
-except ImportError:
-    from langchain_core.tracers import ConsoleCallbackHandler
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)  # silenciar logs de LangChain en chat
@@ -39,6 +33,7 @@ TOOL_MAX_MATCHES = int(os.getenv("AGENT_TOOL_MAX_MATCHES", "6"))
 TOOL_MAX_ROUNDS = int(os.getenv("AGENT_TOOL_MAX_ROUNDS", "3"))
 AGENT_DEBUG_TRACE = os.getenv("AGENT_DEBUG_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 SALON_CODE_PATTERN = re.compile(r"\bj[\s_-]?\d{1,3}(?:-[a-z])?\b", flags=re.IGNORECASE)
+SALON_CODE_LOOSE_PATTERN = re.compile(r"\bj[\s_-]?(\d{1,3})(?:[\s_-]?([a-z]))?\b", flags=re.IGNORECASE)
 HORARIO_CLASS_NAME_KEYS = (
     "clase",
     "clases",
@@ -110,6 +105,8 @@ SALON_HIGH_SIGNAL_TERMS = {
     "digital",
 }
 
+agent_log = logging.getLogger(__name__)
+
 SYSTEM_PROMPT = """Eres un asistente virtual amable y preciso de la universidad.
 
 Reglas obligatorias:
@@ -130,6 +127,9 @@ Uso de tools:
 - Para preguntas sobre información general e institucional del IDIT (qué es el IDIT, servicios disponibles,
   tecnologías, áreas, programas académicos, descripción de laboratorios), usa buscar_informacion_idit.
 - Nunca respondas preguntas sobre equipos o información institucional sin consultar primero las tools correspondientes.
+- Para consultas de salones con nomenclatura/codigo (ejemplo J003, J-003), si buscar_salones_idit devuelve
+    total_matches=0 debes reintentar con una reformulación antes de cerrar respuesta.
+- Si después de los intentos sigue total_matches=0, explica qué attempted_queries se intentaron.
 """
 
 
@@ -137,6 +137,104 @@ def _normalize_lookup_text(value: Any) -> str:
     text = str(value or "").strip().lower()
     normalized = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _emit_structured_debug(event: str, **payload: Any) -> None:
+    """Emite logs estructurados cuando el modo debug del agente esta activo."""
+    if not AGENT_DEBUG_TRACE:
+        return
+
+    record = {
+        "event": event,
+        **payload,
+    }
+    try:
+        printable = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        printable = str(record)
+
+    print(f"[LANGGRAPH_DEBUG] {printable}")
+
+
+def _canonicalize_salon_code(value: Any) -> str:
+    """Normaliza variaciones como J003/j003/j-003 a formato canonico J-003."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    match = SALON_CODE_LOOSE_PATTERN.search(text)
+    if not match:
+        return ""
+
+    try:
+        number = int(match.group(1))
+    except (TypeError, ValueError):
+        return ""
+
+    suffix = str(match.group(2) or "").strip().upper()
+    canonical = f"J-{number:03d}"
+    if suffix:
+        canonical = f"{canonical}-{suffix}"
+    return canonical
+
+
+def _normalize_salon_codes_in_text(value: Any) -> str:
+    """Reescribe codigos de salon en texto libre al formato canonico."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    def _replace(match: re.Match[str]) -> str:
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            return match.group(0)
+
+        suffix = str(match.group(2) or "").strip().upper()
+        canonical = f"J-{number:03d}"
+        if suffix:
+            canonical = f"{canonical}-{suffix}"
+        return canonical
+
+    return SALON_CODE_LOOSE_PATTERN.sub(_replace, text)
+
+
+def _build_salon_query_variants(query: str) -> list[str]:
+    """Genera variantes de consulta para mejorar recall antes de rendirse."""
+    base = str(query or "").strip()
+    if not base:
+        return []
+
+    normalized_full = _normalize_salon_codes_in_text(base)
+    canonical_code = _canonicalize_salon_code(base)
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        key = _normalize_lookup_text(text).replace(" ", "")
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(text)
+
+    _add(base)
+    _add(normalized_full)
+    _add(normalized_full.upper())
+    _add(normalized_full.lower())
+
+    if canonical_code:
+        _add(canonical_code)
+        _add(canonical_code.lower())
+        _add(canonical_code.replace("-", ""))
+        _add(canonical_code.replace("-", "").lower())
+        _add(f"nomenclatura {canonical_code}")
+        _add(f"salon {canonical_code}")
+
+    return variants
 
 
 def _tokenize_for_tool_search(question: str) -> set[str]:
@@ -849,6 +947,149 @@ def _serialize_personal_agenda_for_tool(item: dict[str, Any], score: int, includ
     return {k: v for k, v in payload.items() if v not in (None, "", [], {})}
 
 
+def _score_salones_for_query_variant(
+    salones: list[dict[str, Any]],
+    query_variant: str,
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Primera etapa: scoring semantico en memoria sobre snapshot Firebase."""
+    normalized_query = _normalize_lookup_text(_normalize_salon_codes_in_text(query_variant))
+    terms = _tokenize_for_tool_search(_normalize_salon_codes_in_text(query_variant))
+
+    scored: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for item in salones:
+        if not isinstance(item, dict):
+            continue
+        score, score_debug = _score_salon_item_detailed(item, normalized_query, terms)
+        if score <= 0:
+            continue
+        scored.append((score, item, score_debug))
+
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            float(pair[2].get("coverage_ratio") or 0.0),
+            int(pair[2].get("specific_terms_matched") or 0),
+        ),
+        reverse=True,
+    )
+    return scored
+
+
+def _fallback_match_salones_by_fields(
+    salones: list[dict[str, Any]],
+    query_variant: str,
+) -> tuple[list[tuple[int, dict[str, Any], dict[str, Any]]], str]:
+    """Fallback robusto cuando el scoring principal devuelve 0 resultados."""
+    normalized_variant = _normalize_lookup_text(_normalize_salon_codes_in_text(query_variant))
+    canonical_code = _canonicalize_salon_code(query_variant)
+    normalized_code = _normalize_salon_code(canonical_code or query_variant)
+
+    if not normalized_variant and not normalized_code:
+        return [], "empty_variant"
+
+    field_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for item in salones:
+        if not isinstance(item, dict):
+            continue
+
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        nomen = str(data.get("nomenclatura") or item.get("doc_id") or "").strip()
+        nombre = str(data.get("nombre") or "").strip()
+        id_conjunto = str(data.get("idConjunto") or "").strip()
+
+        nomen_norm = _normalize_lookup_text(nomen)
+        nombre_norm = _normalize_lookup_text(nombre)
+        id_conjunto_norm = _normalize_lookup_text(id_conjunto)
+        nomen_code_norm = _normalize_salon_code(nomen)
+
+        score = 0
+        reasons: list[str] = []
+
+        if normalized_code and normalized_code == nomen_code_norm:
+            score += 220
+            reasons.append("exact_nomenclatura_code")
+
+        if normalized_variant and normalized_variant == nomen_norm:
+            score += 120
+            reasons.append("exact_nomenclatura_text")
+        elif normalized_variant and normalized_variant in nomen_norm:
+            score += 65
+            reasons.append("partial_nomenclatura_text")
+
+        if normalized_variant and normalized_variant == nombre_norm:
+            score += 95
+            reasons.append("exact_nombre")
+        elif normalized_variant and normalized_variant in nombre_norm:
+            score += 55
+            reasons.append("partial_nombre")
+
+        if normalized_variant and normalized_variant == id_conjunto_norm:
+            score += 70
+            reasons.append("exact_idConjunto")
+
+        if score <= 0:
+            continue
+
+        field_matches.append(
+            (
+                score,
+                item,
+                {
+                    "fallback_mode": "field_match",
+                    "reasons": reasons,
+                },
+            )
+        )
+
+    if field_matches:
+        field_matches.sort(key=lambda pair: pair[0], reverse=True)
+        return field_matches, "field_match"
+
+    fuzzy_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    if not normalized_variant:
+        return [], "no_fuzzy_input"
+
+    for item in salones:
+        if not isinstance(item, dict):
+            continue
+
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        fields: dict[str, str] = {
+            "nomenclatura": _normalize_lookup_text(data.get("nomenclatura") or item.get("doc_id") or ""),
+            "nombre": _normalize_lookup_text(data.get("nombre") or ""),
+            "idConjunto": _normalize_lookup_text(data.get("idConjunto") or ""),
+        }
+
+        best_field = ""
+        best_ratio = 0.0
+        for field_name, field_value in fields.items():
+            if not field_value:
+                continue
+            ratio = SequenceMatcher(None, normalized_variant, field_value).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_field = field_name
+
+        if best_ratio < 0.72:
+            continue
+
+        score = int(round(best_ratio * 90))
+        fuzzy_matches.append(
+            (
+                score,
+                item,
+                {
+                    "fallback_mode": "fuzzy_match",
+                    "best_field": best_field,
+                    "similarity": round(best_ratio, 4),
+                },
+            )
+        )
+
+    fuzzy_matches.sort(key=lambda pair: pair[0], reverse=True)
+    return fuzzy_matches, "fuzzy_match"
+
+
 @tool("buscar_salones_idit")
 def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool = True) -> str:
     """Busca salones y servicios del IDIT en datos operativos en vivo.
@@ -876,39 +1117,95 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
     snapshot = fetch_firebase_live_snapshot()
     salones = snapshot.get("salones", []) if isinstance(snapshot, dict) else []
 
-    normalized_query = _normalize_lookup_text(query)
-    terms = _tokenize_for_tool_search(query)
+    limit = max(1, min(max_matches, 12))
+    normalized_query = _normalize_salon_codes_in_text(query)
+    query_variants = _build_salon_query_variants(query)
+    if not query_variants:
+        query_variants = [str(query or "").strip()]
 
-    scored: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
-    for item in salones:
-        if not isinstance(item, dict):
-            continue
-        score, score_debug = _score_salon_item_detailed(item, normalized_query, terms)
-        if score > 0:
-            scored.append((score, item, score_debug))
+    attempted_queries: list[str] = []
+    attempts_debug: list[dict[str, Any]] = []
 
-    scored.sort(
-        key=lambda pair: (
-            pair[0],
-            float(pair[2].get("coverage_ratio") or 0.0),
-            int(pair[2].get("specific_terms_matched") or 0),
+    # Acumulamos por documento para conservar el mejor score entre variantes.
+    best_by_doc: dict[str, tuple[int, dict[str, Any], dict[str, Any], str]] = {}
+
+    for idx, variant in enumerate(query_variants, start=1):
+        attempted_queries.append(variant)
+        firestore_query = {
+            "collection": "salones",
+            "attempt_index": idx,
+            "query": variant,
+            "normalized_query": _normalize_salon_codes_in_text(variant),
+        }
+
+        _emit_structured_debug(
+            "tool.buscar_salones_idit.firestore_query",
+            firestore_query=firestore_query,
+            include_schedule=include_schedule,
+        )
+
+        scored = _score_salones_for_query_variant(salones, variant)
+        search_mode = "score"
+        if not scored:
+            scored, search_mode = _fallback_match_salones_by_fields(salones, variant)
+
+        attempts_debug.append(
+            {
+                "query": variant,
+                "search_mode": search_mode,
+                "matches_found": len(scored),
+                "firestore_query": firestore_query,
+            }
+        )
+
+        for score, item, score_debug in scored[: max(limit * 2, 12)]:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            doc_id = str(item.get("doc_id") or data.get("nomenclatura") or "").strip()
+            if not doc_id:
+                continue
+
+            enriched_debug = dict(score_debug or {})
+            enriched_debug["matched_by_query"] = variant
+            enriched_debug["search_mode"] = search_mode
+
+            previous = best_by_doc.get(doc_id)
+            if previous is None or score > previous[0]:
+                best_by_doc[doc_id] = (score, item, enriched_debug, variant)
+
+    selected = sorted(
+        best_by_doc.values(),
+        key=lambda entry: (
+            entry[0],
+            float(entry[2].get("coverage_ratio") or 0.0),
+            int(entry[2].get("specific_terms_matched") or 0),
         ),
         reverse=True,
-    )
+    )[:limit]
 
-    limit = max(1, min(max_matches, 12))
-    if not scored:
-        selected = []
-    else:
-        selected = scored[:limit]
+    matches_payload: list[dict[str, Any]] = []
+    for score, item, score_debug, matched_query in selected:
+        serialized = _serialize_salon_for_tool(item, score, include_schedule=include_schedule)
+        serialized["matched_query"] = matched_query
+        if AGENT_DEBUG_TRACE:
+            serialized["score_debug"] = {
+                key: value
+                for key, value in score_debug.items()
+                if key in {"search_mode", "matched_by_query", "reasons", "best_field", "similarity", "top_score_components"}
+            }
+        matches_payload.append(serialized)
 
     payload = {
         "query": query,
-        "total_matches": len(selected),
-        "matches": [
-            _serialize_salon_for_tool(item, score, include_schedule=include_schedule)
-            for score, item, _ in selected
-        ],
+        "normalized_query": normalized_query,
+        "attempted_queries": attempted_queries,
+        "total_attempts": len(attempted_queries),
+        "total_matches": len(matches_payload),
+        "matches": matches_payload,
+        "debug_info": {
+            "source": "firebase_live_snapshot_memory_scan",
+            "firestore_queries": [attempt.get("firestore_query") for attempt in attempts_debug],
+            "attempts": attempts_debug,
+        },
     }
 
     return json.dumps(payload, ensure_ascii=False)
@@ -956,11 +1253,23 @@ def buscar_personal_idit(query: str, max_matches: int = 5, include_schedule: boo
 
     payload = {
         "query": query,
+        "normalized_query": _normalize_salon_codes_in_text(query),
+        "attempted_queries": [query],
+        "total_attempts": 1,
         "total_matches": len(selected),
         "matches": [
             _serialize_user_for_tool(item, score, include_schedule=include_schedule)
             for score, item in selected
         ],
+        "debug_info": {
+            "source": "firebase_live_snapshot_memory_scan",
+            "firestore_queries": [
+                {
+                    "collection": "usuarios",
+                    "query": query,
+                }
+            ],
+        },
     }
 
     return json.dumps(payload, ensure_ascii=False)
@@ -1010,18 +1319,32 @@ def obtener_agenda_personal_idit(query: str, max_matches: int = 3, include_detai
 
     payload = {
         "query": query,
+        "normalized_query": _normalize_salon_codes_in_text(query),
+        "attempted_queries": [query],
+        "total_attempts": 1,
         "total_matches": len(selected),
         "matches": [
             _serialize_personal_agenda_for_tool(item, score, include_details=include_details)
             for score, item in selected
         ],
+        "debug_info": {
+            "source": "firebase_live_snapshot_memory_scan",
+            "firestore_queries": [
+                {
+                    "collection": "usuarios/horarios",
+                    "query": query,
+                }
+            ],
+        },
     }
 
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _normalize_salon_code(value: Any) -> str:
-    return _normalize_lookup_text(value).replace(" ", "").replace("_", "")
+    canonical = _canonicalize_salon_code(value)
+    base = canonical if canonical else str(value or "")
+    return _normalize_lookup_text(base).replace(" ", "").replace("_", "").replace("-", "")
 
 
 class AgentState(TypedDict):
@@ -1029,6 +1352,9 @@ class AgentState(TypedDict):
     chroma_context: str
     firebase_context: str
     question: str
+    original_question: str
+    salon_retry_count: int
+    debug_trace: dict[str, Any]
 
 
 def _truncate_history_text(text: str, max_chars: int = 350) -> str:
@@ -1036,6 +1362,23 @@ def _truncate_history_text(text: str, max_chars: int = 350) -> str:
     if len(compact) <= max_chars:
         return compact
     return f"{compact[: max_chars - 3]}..."
+
+
+def _truncate_context_block(text: str, max_chars: int) -> str:
+    """Recorta contexto largo para evitar rebasar el limite de tokens del modelo."""
+    payload = str(text or "")
+    if len(payload) <= max_chars:
+        return payload
+
+    if max_chars <= 120:
+        return payload[:max_chars]
+
+    marker = "\n...[contexto truncado por limite de tokens]...\n"
+    keep_each = max(20, (max_chars - len(marker)) // 2)
+    head = payload[:keep_each]
+    tail = payload[-keep_each:]
+    clipped = f"{head}{marker}{tail}"
+    return clipped[:max_chars]
 
 
 def _history_to_messages(historial: list[dict]) -> list[BaseMessage]:
@@ -1050,8 +1393,269 @@ def _history_to_messages(historial: list[dict]) -> list[BaseMessage]:
     return messages
 
 
+def _preview_json(value: Any, *, max_chars: int = 280) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        text = str(value)
+    compact = " ".join(text.split())
+    if len(compact) <= max_chars:
+        return compact
+    return f"{compact[: max_chars - 3]}..."
+
+
+def _extract_tool_message_preview(content: Any, *, max_chars: int = 320) -> str:
+    if isinstance(content, str):
+        return _truncate_history_text(content, max_chars=max_chars)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+            elif isinstance(part, dict):
+                text_part = str(part.get("text") or "").strip()
+                if text_part:
+                    parts.append(text_part)
+        return _truncate_history_text(" ".join(parts), max_chars=max_chars)
+    return _truncate_history_text(str(content), max_chars=max_chars)
+
+
+def _print_pretty_debug_trace(*, question: str, final_state: dict[str, Any], final_text: str) -> None:
+    debug_trace = final_state.get("debug_trace") if isinstance(final_state, dict) else {}
+    if not isinstance(debug_trace, dict):
+        debug_trace = {}
+
+    totals = debug_trace.get("firebase_totals") if isinstance(debug_trace.get("firebase_totals"), dict) else {}
+    firebase_error = str(debug_trace.get("firebase_error") or "").strip()
+    firebase_context_chars = int(debug_trace.get("firebase_context_chars") or 0)
+    firebase_context_chars_prompt = int(debug_trace.get("firebase_context_chars_prompt") or firebase_context_chars)
+
+    print("\n" + "=" * 72)
+    print("TRACE LANGGRAPH (DEBUG)")
+    print("=" * 72)
+    print(f"Pregunta: {question}")
+    print(
+        "Contexto Firebase: "
+        f"salones={totals.get('salones', 0)} | "
+        f"usuarios_objetivo={totals.get('usuarios_objetivo', 0)} | "
+        f"usuarios_all={totals.get('usuarios_all', 0)} | "
+        f"chars_prompt={firebase_context_chars_prompt} | chars_total={firebase_context_chars}"
+    )
+    if firebase_error:
+        print(f"Firebase warning: {firebase_error}")
+
+    messages = final_state.get("messages") if isinstance(final_state, dict) else []
+    if not isinstance(messages, list):
+        messages = []
+
+    print("\nPasos de tools:")
+    step = 0
+    for message in messages:
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            for tool_call in message.tool_calls:
+                step += 1
+                tool_name = str(tool_call.get("name") or "tool_sin_nombre")
+                args_preview = _preview_json(tool_call.get("args") or {})
+                print(f"  {step}. CALL  {tool_name}")
+                print(f"     args: {args_preview}")
+        elif isinstance(message, ToolMessage):
+            tool_name = str(getattr(message, "name", "") or "tool_resultado")
+            preview = _extract_tool_message_preview(getattr(message, "content", ""))
+            print(f"     RESULT {tool_name}: {preview}")
+
+    if step == 0:
+        print("  (sin invocaciones de tools)")
+
+    graph_events = debug_trace.get("events") if isinstance(debug_trace.get("events"), list) else []
+    if graph_events:
+        print("\nEventos de grafo:")
+        for idx, event in enumerate(graph_events[-12:], start=1):
+            if not isinstance(event, dict):
+                continue
+            event_name = str(event.get("event") or "evento")
+            event_payload = {
+                key: value
+                for key, value in event.items()
+                if key != "event"
+            }
+            print(f"  {idx}. {event_name}: {_preview_json(event_payload, max_chars=220)}")
+
+    print("\nRespuesta final:")
+    print(_truncate_history_text(final_text, max_chars=900))
+    print("=" * 72 + "\n")
+
+
+def _append_graph_event(debug_trace: dict[str, Any], event: str, **payload: Any) -> dict[str, Any]:
+    """Acumula eventos estructurados del flujo LangGraph en el estado."""
+    existing_events = debug_trace.get("events") if isinstance(debug_trace.get("events"), list) else []
+    events = [item for item in existing_events if isinstance(item, dict)]
+    events.append({"event": event, **payload})
+
+    # Mantener buffer acotado para no inflar el estado.
+    if len(events) > 40:
+        events = events[-40:]
+
+    updated = dict(debug_trace)
+    updated["events"] = events
+    _emit_structured_debug(f"graph.{event}", **payload)
+    return updated
+
+
+def _safe_parse_tool_payload(content: Any) -> dict[str, Any]:
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+            elif isinstance(part, dict):
+                text_part = str(part.get("text") or "").strip()
+                if text_part:
+                    parts.append(text_part)
+        if parts:
+            content = " ".join(parts)
+    if isinstance(content, str):
+        raw = content.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _latest_tool_payload(messages: list[BaseMessage], tool_name: str) -> dict[str, Any]:
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage) and str(getattr(message, "name", "") or "") == tool_name:
+            return _safe_parse_tool_payload(getattr(message, "content", ""))
+    return {}
+
+
+def _collect_salones_attempted_queries(messages: list[BaseMessage]) -> list[str]:
+    attempts: list[str] = []
+    seen: set[str] = set()
+
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "buscar_salones_idit":
+            continue
+
+        payload = _safe_parse_tool_payload(getattr(message, "content", ""))
+        for query in payload.get("attempted_queries") or []:
+            text = str(query or "").strip()
+            if not text:
+                continue
+            key = _normalize_lookup_text(text)
+            if key in seen:
+                continue
+            seen.add(key)
+            attempts.append(text)
+
+    return attempts
+
+
+def _looks_like_salon_question(question: str) -> bool:
+    normalized = _normalize_lookup_text(question)
+    if not normalized:
+        return False
+    if SALON_CODE_PATTERN.search(normalized):
+        return True
+
+    tokens = _tokenize_for_tool_search(question)
+    if not tokens:
+        return False
+    if tokens & SALON_GENERIC_TERMS:
+        return True
+    if tokens & SALON_HIGH_SIGNAL_TERMS:
+        return True
+    return any(token.startswith("j") and token[1:].isdigit() for token in tokens)
+
+
+def _build_retry_query(question: str, retry_count: int) -> str:
+    variants = _build_salon_query_variants(question)
+    if not variants:
+        return question
+
+    index = min(max(0, retry_count), len(variants) - 1)
+    return variants[index]
+
+
+def _payload_total_matches(payload: dict[str, Any]) -> int:
+    try:
+        return max(0, int(payload.get("total_matches") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _has_successful_salones_tool_result(messages: list[BaseMessage]) -> bool:
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "buscar_salones_idit":
+            continue
+        payload = _safe_parse_tool_payload(getattr(message, "content", ""))
+        if _payload_total_matches(payload) > 0:
+            return True
+    return False
+
+
+def _should_force_salon_retry(state: AgentState, max_retries: int) -> bool:
+    retry_count = int(state.get("salon_retry_count") or 0)
+    if retry_count >= max_retries:
+        return False
+
+    question = str(state.get("original_question") or state.get("question") or "")
+    if not _looks_like_salon_question(question):
+        return False
+
+    messages = state.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return False
+
+    if _has_successful_salones_tool_result(messages):
+        return False
+
+    latest_payload = _latest_tool_payload(messages, "buscar_salones_idit")
+    if not latest_payload:
+        return False
+
+    latest_matches = _payload_total_matches(latest_payload)
+    if latest_matches > 0:
+        return False
+
+    return True
+
+
+def _build_attempts_explanation(question: str, messages: list[BaseMessage]) -> str:
+    if not _looks_like_salon_question(question):
+        return ""
+
+    attempted_queries = _collect_salones_attempted_queries(messages)
+    if not attempted_queries:
+        return ""
+
+    attempted_preview = ", ".join(attempted_queries[:8])
+    if len(attempted_queries) > 8:
+        attempted_preview += ", ..."
+
+    return (
+        "No encontré coincidencias para esa búsqueda de salón. "
+        f"Intenté estas consultas: {attempted_preview}. "
+        "Si quieres, puedo intentarlo con el nombre completo del laboratorio o con otra nomenclatura."
+    )
+
+
 def build_graph(vector_store: Chroma, frontend_context: str | None = None):
     llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
+    raw_retries = os.getenv("AGENT_FORCE_SALON_RETRIES", "2")
+    try:
+        max_forced_salon_retries = max(0, min(6, int(str(raw_retries).strip() or "2")))
+    except ValueError:
+        max_forced_salon_retries = 2
     
     # Definir tools de ChromaDB con closure sobre vector_store
     @tool("buscar_equipos_idit")
@@ -1114,8 +1718,14 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
 
         payload = {
             "query": query,
+            "attempted_queries": [query],
+            "total_attempts": 1,
             "total_matches": len(matches),
             "matches": matches,
+            "debug_info": {
+                "source": "chroma_similarity_search",
+                "collection": COLLECTION_NAME,
+            },
         }
         return json.dumps(payload, ensure_ascii=False)
 
@@ -1161,8 +1771,14 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
 
         payload = {
             "query": query,
+            "attempted_queries": [query],
+            "total_attempts": 1,
             "total_matches": len(matches),
             "matches": matches,
+            "debug_info": {
+                "source": "chroma_similarity_search",
+                "collection": COLLECTION_NAME,
+            },
         }
         return json.dumps(payload, ensure_ascii=False)
     
@@ -1178,45 +1794,135 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
 
     def retrieve_context(state: AgentState) -> dict[str, Any]:
         question = str(state.get("question") or "").strip()
+        original_question = str(state.get("original_question") or question).strip()
+
+        if not question and original_question:
+            question = _normalize_salon_codes_in_text(original_question)
 
         firebase_runtime = build_firebase_runtime_context(
             question,
             frontend_context=frontend_context,
         )
         firebase_context = str(firebase_runtime.get("context_text") or "Sin datos operativos")
+        raw_context_limit = os.getenv("AGENT_FIREBASE_CONTEXT_MAX_CHARS", "1600")
+        try:
+            firebase_context_max_chars = max(600, int(str(raw_context_limit).strip() or "1600"))
+        except ValueError:
+            firebase_context_max_chars = 1600
+        firebase_context_for_prompt = _truncate_context_block(firebase_context, firebase_context_max_chars)
+        debug_trace = dict(state.get("debug_trace") or {})
+        debug_trace["firebase_totals"] = (
+            firebase_runtime.get("totals") if isinstance(firebase_runtime.get("totals"), dict) else {}
+        )
+        debug_trace["firebase_error"] = str(firebase_runtime.get("error") or "")
+        debug_trace["firebase_context_chars"] = len(firebase_context)
+        debug_trace["firebase_context_chars_prompt"] = len(firebase_context_for_prompt)
+        debug_trace = _append_graph_event(
+            debug_trace,
+            "retrieve_context",
+            question_original=original_question,
+            question_normalized=question,
+            firebase_totals=debug_trace.get("firebase_totals") or {},
+            firebase_prompt_chars=len(firebase_context_for_prompt),
+        )
 
         context_block = (
             "[DATOS OPERATIVOS EN VIVO - FIREBASE]\n"
-            f"{firebase_context}\n\n"
+            f"{firebase_context_for_prompt}\n\n"
+            "[PREGUNTA ORIGINAL]\n"
+            f"{original_question}\n\n"
+            "[PREGUNTA NORMALIZADA]\n"
+            f"{question}\n\n"
             "[PREGUNTA]\n"
             f"{question}"
         )
 
         return {
             "chroma_context": "",
-            "firebase_context": firebase_context,
+            "firebase_context": firebase_context_for_prompt,
             "messages": [HumanMessage(content=context_block)],
+            "question": question,
+            "original_question": original_question,
+            "debug_trace": debug_trace,
         }
 
     def agent(state: AgentState) -> dict[str, Any]:
         response = model_with_tools.invoke(state["messages"])
-        return {"messages": [response]}
+        tool_calls = []
+        if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
+            tool_calls = [str(call.get("name") or "") for call in response.tool_calls]
+
+        debug_trace = _append_graph_event(
+            dict(state.get("debug_trace") or {}),
+            "agent_response",
+            has_tool_calls=bool(tool_calls),
+            tool_calls=tool_calls,
+            message_type=type(response).__name__,
+        )
+
+        return {
+            "messages": [response],
+            "debug_trace": debug_trace,
+        }
+
+    def retry_salones(state: AgentState) -> dict[str, Any]:
+        retry_count = int(state.get("salon_retry_count") or 0)
+        question_base = str(state.get("question") or state.get("original_question") or "")
+        retry_query = _build_retry_query(question_base, retry_count + 1)
+
+        call_id = f"forced_salon_retry_{retry_count + 1}"
+        forced_tool_call = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "name": "buscar_salones_idit",
+                    "args": {
+                        "query": retry_query,
+                        "max_matches": max(6, TOOL_MAX_MATCHES),
+                        "include_schedule": True,
+                    },
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+        debug_trace = _append_graph_event(
+            dict(state.get("debug_trace") or {}),
+            "forced_salon_retry",
+            retry_index=retry_count + 1,
+            retry_query=retry_query,
+        )
+
+        return {
+            "messages": [forced_tool_call],
+            "salon_retry_count": retry_count + 1,
+            "debug_trace": debug_trace,
+        }
 
     def should_continue(state: AgentState) -> str:
         messages = state.get("messages") or []
         if not messages:
+            _emit_structured_debug("graph.route", decision="end", reason="empty_messages")
             return "end"
 
         last_message = messages[-1]
         if isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None):
+            _emit_structured_debug("graph.route", decision="tools", reason="model_tool_calls")
             return "tools"
 
+        if _should_force_salon_retry(state, max_retries=max_forced_salon_retries):
+            _emit_structured_debug("graph.route", decision="retry_salones", reason="empty_salones_result")
+            return "retry_salones"
+
+        _emit_structured_debug("graph.route", decision="end", reason="no_tool_calls")
         return "end"
 
     workflow = StateGraph(AgentState)
     workflow.add_node("retrieve_context", retrieve_context)
     workflow.add_node("agent", agent)
     workflow.add_node("tools", tool_node)
+    workflow.add_node("retry_salones", retry_salones)
 
     workflow.set_entry_point("retrieve_context")
     workflow.add_edge("retrieve_context", "agent")
@@ -1225,9 +1931,11 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
         should_continue,
         {
             "tools": "tools",
+            "retry_salones": "retry_salones",
             "end": END,
         },
     )
+    workflow.add_edge("retry_salones", "tools")
     workflow.add_edge("tools", "agent")
 
     return workflow.compile()
@@ -1288,17 +1996,25 @@ def generar_respuesta_rag(
     frontend_context: str | None = None,
 ) -> str:
     """Responde con RAG usando un flujo de estado en LangGraph."""
+    pregunta_original = str(pregunta or "").strip()
+    pregunta_normalizada = _normalize_salon_codes_in_text(pregunta_original)
+
     graph = build_graph(vector_store, frontend_context=frontend_context)
     initial_state: AgentState = {
         "messages": _history_to_messages(historial),
         "chroma_context": "",
         "firebase_context": "",
-        "question": pregunta,
+        "question": pregunta_normalizada,
+        "original_question": pregunta_original,
+        "salon_retry_count": 0,
+        "debug_trace": {
+            "question_original": pregunta_original,
+            "question_normalized": pregunta_normalizada,
+        },
     }
 
     if AGENT_DEBUG_TRACE:
-        config = RunnableConfig(callbacks=[ConsoleCallbackHandler()])
-        final_state = graph.invoke(initial_state, config=config, debug=True)
+        final_state = graph.invoke(initial_state)
     else:
         final_state = graph.invoke(initial_state)
 
@@ -1331,6 +2047,18 @@ def generar_respuesta_rag(
 
     if not final_text:
         return "No tengo esa información disponible."
+
+    if isinstance(messages, list):
+        attempted_explanation = _build_attempts_explanation(pregunta_original, messages)
+        if attempted_explanation and not _has_successful_salones_tool_result(messages):
+            final_text = attempted_explanation
+
+    if AGENT_DEBUG_TRACE and isinstance(final_state, dict):
+        _print_pretty_debug_trace(
+            question=pregunta_original,
+            final_state=final_state,
+            final_text=final_text,
+        )
 
     return _sanitize_user_facing_response(final_text)
 

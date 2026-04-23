@@ -67,6 +67,7 @@ DEFAULT_PROFESSOR_VALUE_MARKERS = {
     "faculty",
     "catedratico",
     "catedratica",
+    "encargado"
 }
 
 DEFAULT_TARGET_USER_ROLES = {
@@ -99,14 +100,8 @@ DEFAULT_USERS_COLLECTION_ALLOWLIST = [
     "usuarios",
     "horarios",
     "horrios",
-    "calendarios",
-    "calendario",
-    "citas",
-    "cita",
-    "notificaciones",
-    "notificacion",
-    "notifications",
 ]
+DEFAULT_USERS_ALLOWED_LEAF_COLLECTIONS = {"usuarios", "horarios", "horrios"}
 
 DEFAULT_CITAS_COLLECTION_CANDIDATES = ["citas", "cita", "appointments", "appointment"]
 DEFAULT_NOTIFICACIONES_COLLECTION_CANDIDATES = [
@@ -387,6 +382,19 @@ def _optional_int_env(name: str, default: int | None) -> int | None:
 
     try:
         return max(0, int(raw.strip()))
+    except ValueError:
+        log.warning("Valor invalido para %s='%s'. Se usara default=%s", name, raw, default)
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    """Lee un entero positivo del entorno."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+
+    try:
+        return max(1, int(raw.strip()))
     except ValueError:
         log.warning("Valor invalido para %s='%s'. Se usara default=%s", name, raw, default)
         return default
@@ -1255,18 +1263,49 @@ def _merge_documents_for_collections(
 
 
 def _build_users_collection_config() -> dict[str, Any]:
+    strict_core_only = _bool_env("FIREBASE_USERS_STRICT_CORE_ONLY", True)
+    allowed_leaf_collections = set(DEFAULT_USERS_ALLOWED_LEAF_COLLECTIONS)
+
+    if not strict_core_only:
+        custom_allowed = {
+            _collection_leaf_name(item)
+            for item in _split_csv_env("FIREBASE_USERS_ALLOWED_COLLECTION_LEAVES")
+            if _collection_leaf_name(item)
+        }
+        if custom_allowed:
+            allowed_leaf_collections = custom_allowed
+
+    def _filter_candidates(candidates: list[str]) -> list[str]:
+        filtered: list[str] = []
+        seen_leaves: set[str] = set()
+        for candidate in candidates:
+            leaf = _collection_leaf_name(candidate)
+            if not leaf or leaf not in allowed_leaf_collections or leaf in seen_leaves:
+                continue
+            seen_leaves.add(leaf)
+            filtered.append(candidate)
+        return filtered
+
     usuarios_collection = _collection_env("FIREBASE_USUARIOS_COLLECTION", "usuarios")
+    if _collection_leaf_name(usuarios_collection) not in allowed_leaf_collections:
+        usuarios_collection = "usuarios"
+
     configured_horarios = _collection_env("FIREBASE_HORARIOS_COLLECTION", "horarios")
     configured_calendarios = _collection_env("FIREBASE_CALENDARIOS_COLLECTION", "calendarios")
     configured_citas = _collection_env("FIREBASE_CITAS_COLLECTION", "citas")
     configured_notificaciones = _collection_env("FIREBASE_NOTIFICACIONES_COLLECTION", "notificaciones")
 
-    horarios_candidates = _collection_candidates(configured_horarios, ["horarios", "horrios"])
-    calendarios_candidates = _collection_candidates(configured_calendarios, ["calendarios", "calendario"])
-    citas_candidates = _collection_candidates(configured_citas, list(DEFAULT_CITAS_COLLECTION_CANDIDATES))
-    notificaciones_candidates = _collection_candidates(
-        configured_notificaciones,
-        list(DEFAULT_NOTIFICACIONES_COLLECTION_CANDIDATES),
+    horarios_candidates = _filter_candidates(
+        _collection_candidates(configured_horarios, ["horarios", "horrios"])
+    )
+    calendarios_candidates = _filter_candidates(
+        _collection_candidates(configured_calendarios, ["calendarios", "calendario"])
+    )
+    citas_candidates = _filter_candidates(
+        _collection_candidates(configured_citas, list(DEFAULT_CITAS_COLLECTION_CANDIDATES))
+    )
+    notificaciones_candidates = _filter_candidates(
+        _collection_candidates(configured_notificaciones, list(DEFAULT_NOTIFICACIONES_COLLECTION_CANDIDATES))
     )
 
     return {
@@ -1279,6 +1318,8 @@ def _build_users_collection_config() -> dict[str, Any]:
         "calendarios_candidates": calendarios_candidates,
         "citas_candidates": citas_candidates,
         "notificaciones_candidates": notificaciones_candidates,
+        "allowed_leaf_collections": sorted(allowed_leaf_collections),
+        "strict_core_only": strict_core_only,
     }
 
 
@@ -1534,8 +1575,6 @@ def fetch_salones_documents() -> list[Document]:
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
         "FIREBASE_SALONES_COLLECTIONS",
     )
-    if not collection_allowlist:
-        collection_allowlist = list(DEFAULT_SALONES_COLLECTION_ALLOWLIST)
 
     documents: list[Document] = []
 
@@ -1718,8 +1757,6 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
         "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
         "FIREBASE_SALONES_COLLECTIONS",
     )
-    if not collection_allowlist:
-        collection_allowlist = list(DEFAULT_SALONES_COLLECTION_ALLOWLIST)
 
     salones: list[dict[str, Any]] = []
     for record in client.iter_documents(
@@ -1833,18 +1870,13 @@ def fetch_users_all_raw_records(*, target_user_ids: set[str] | None = None) -> l
         return []
 
     config = _build_users_collection_config()
-    if target_user_ids is None:
-        usuarios_by_id = client.get_documents_by_id(config["usuarios_collection"])
-        target_user_ids = {
-            _clean_text(doc_id)
-            for doc_id, usuario_record in usuarios_by_id.items()
-            if _is_professor_record(usuario_record.data)
-        }
-    else:
-        target_user_ids = {_clean_text(doc_id) for doc_id in target_user_ids if _clean_text(doc_id)}
-
-    if not target_user_ids:
-        return []
+    allowed_leaf_collections = set(config.get("allowed_leaf_collections") or DEFAULT_USERS_ALLOWED_LEAF_COLLECTIONS)
+    normalized_target_user_ids = {
+        _clean_text(doc_id)
+        for doc_id in (target_user_ids or set())
+        if _clean_text(doc_id)
+    }
+    apply_target_filter = bool(normalized_target_user_ids)
 
     related_leaf_collections = {
         _collection_leaf_name(config["usuarios_collection"]),
@@ -1854,6 +1886,7 @@ def fetch_users_all_raw_records(*, target_user_ids: set[str] | None = None) -> l
         *(_collection_leaf_name(name) for name in config["notificaciones_candidates"]),
     }
     related_leaf_collections = {name for name in related_leaf_collections if name}
+    usuarios_leaf = _collection_leaf_name(config["usuarios_collection"])
 
     include_subcollections = _bool_env("FIREBASE_USERS_INCLUDE_SUBCOLLECTIONS", True)
     max_depth = _optional_int_env("FIREBASE_USERS_MAX_TRAVERSAL_DEPTH", None)
@@ -1863,6 +1896,12 @@ def fetch_users_all_raw_records(*, target_user_ids: set[str] | None = None) -> l
     )
     if not collection_allowlist:
         collection_allowlist = list(DEFAULT_USERS_COLLECTION_ALLOWLIST)
+    else:
+        filtered_allowlist: list[str] = []
+        for path in collection_allowlist:
+            if _collection_leaf_name(path) in allowed_leaf_collections:
+                filtered_allowlist.append(path)
+        collection_allowlist = filtered_allowlist or list(DEFAULT_USERS_COLLECTION_ALLOWLIST)
 
     records: list[dict[str, Any]] = []
     for record in client.iter_documents(
@@ -1875,14 +1914,18 @@ def fetch_users_all_raw_records(*, target_user_ids: set[str] | None = None) -> l
         doc_id = _clean_text(payload.get("doc_id"))
         collection_leaf = _collection_leaf_name(payload.get("collection"))
 
-        if _is_student_record(data):
+        if collection_leaf and collection_leaf not in allowed_leaf_collections:
             continue
 
-        if collection_leaf in related_leaf_collections and doc_id not in target_user_ids:
-            continue
+        if apply_target_filter:
+            if _is_student_record(data):
+                continue
 
-        if collection_leaf == _collection_leaf_name(config["usuarios_collection"]) and not _is_professor_record(data):
-            continue
+            if collection_leaf in related_leaf_collections and doc_id not in normalized_target_user_ids:
+                continue
+
+            if collection_leaf == usuarios_leaf and doc_id not in normalized_target_user_ids:
+                continue
 
         records.append(payload)
 
@@ -1994,11 +2037,14 @@ def fetch_firebase_live_snapshot(*, force_refresh: bool = False) -> dict[str, An
         errors.append(f"usuarios: {exc}")
         log.warning("No fue posible cargar usuarios en vivo: %s", exc)
 
-    target_user_ids = {
-        _clean_text(item.get("doc_id"))
-        for item in usuarios
-        if isinstance(item, dict) and _clean_text(item.get("doc_id"))
-    }
+    users_all_filter_to_targets = _bool_env("FIREBASE_USERS_ALL_FILTER_TO_TARGETS", False)
+    target_user_ids: set[str] | None = None
+    if users_all_filter_to_targets:
+        target_user_ids = {
+            _clean_text(item.get("doc_id"))
+            for item in usuarios
+            if isinstance(item, dict) and _clean_text(item.get("doc_id"))
+        }
 
     try:
         usuarios_all = fetch_users_all_raw_records(target_user_ids=target_user_ids)
@@ -2357,14 +2403,14 @@ def _serialize_items_with_char_budget(items: list[dict[str, Any]], max_chars: in
 def build_firebase_runtime_context(
     question: str,
     *,
-    max_salones: int = 3,
-    max_usuarios: int = 3,
+    max_salones: int = 10,
+    max_usuarios: int = 10,
     frontend_context: str | None = None,
 ) -> dict[str, Any]:
     """Construye contexto Firebase en vivo (sin Markdown) relevante para la pregunta."""
     schedule_requested = _question_requests_schedule(question)
     schedule_details_requested = _question_requests_detailed_schedule(question)
-    include_schedule_in_context = schedule_requested
+    include_schedule_in_context = schedule_details_requested
     front_payload = _parse_frontend_context(frontend_context)
 
     try:
@@ -2405,22 +2451,31 @@ def build_firebase_runtime_context(
         reverse=True,
     )
 
-    salones_limit = 6 if wants_broad else max(1, max_salones)
-    usuarios_limit = 6 if wants_broad else max(1, max_usuarios)
-    usuarios_all_limit = 8 if wants_broad else 3
+    max_salones_context = _int_env("FIREBASE_RUNTIME_MAX_SALONES_CONTEXT", 8)
+    max_usuarios_context = _int_env("FIREBASE_RUNTIME_MAX_USUARIOS_CONTEXT", 8)
+    max_usuarios_all_context = _int_env("FIREBASE_RUNTIME_MAX_USUARIOS_ALL_CONTEXT", 12)
+
+    salones_limit = max(max_salones_context, max(1, max_salones))
+    usuarios_limit = max(max_usuarios_context, max(1, max_usuarios))
+    usuarios_all_limit = max(6, max_usuarios_all_context)
+
+    if wants_broad:
+        salones_limit = max(salones_limit, max_salones_context * 2)
+        usuarios_limit = max(usuarios_limit, max_usuarios_context * 2)
+        usuarios_all_limit = max(usuarios_all_limit, max_usuarios_all_context * 2)
 
     selected_salones = [item for item, score in salones_scored if score > 0][:salones_limit]
     selected_usuarios = [item for item, score in usuarios_scored if score > 0][:usuarios_limit]
     selected_usuarios_all = [item for item, score in usuarios_all_collections_scored if score > 0][:usuarios_all_limit]
 
     if not selected_salones:
-        selected_salones = [item for item, _ in salones_scored[: min(2, len(salones_scored))]]
+        selected_salones = [item for item, _ in salones_scored[: min(salones_limit, len(salones_scored))]]
     if not selected_usuarios:
-        selected_usuarios = [item for item, _ in usuarios_scored[: min(2, len(usuarios_scored))]]
+        selected_usuarios = [item for item, _ in usuarios_scored[: min(usuarios_limit, len(usuarios_scored))]]
     if not selected_usuarios_all:
         selected_usuarios_all = [
             item
-            for item, _ in usuarios_all_collections_scored[: min(2, len(usuarios_all_collections_scored))]
+            for item, _ in usuarios_all_collections_scored[: min(usuarios_all_limit, len(usuarios_all_collections_scored))]
         ]
 
     compact_salones = [
@@ -2441,19 +2496,22 @@ def build_firebase_runtime_context(
         salones_all,
         include_schedule=include_schedule_in_context,
     )
-    front_route_db_cross_json = _serialize_object_with_char_budget(front_route_db_cross, max_chars=1600)
+    front_route_db_cross_json = _serialize_object_with_char_budget(
+        front_route_db_cross,
+        max_chars=_int_env("FIREBASE_RUNTIME_MAX_CHARS_FRONT_ROUTE_DB_CROSS", 1600),
+    )
 
     salones_json, salones_included, salones_total_selected = _serialize_items_with_char_budget(
         compact_salones,
-        max_chars=4600,
+        max_chars=_int_env("FIREBASE_RUNTIME_MAX_CHARS_SALONES", 4800),
     )
     usuarios_json, usuarios_included, usuarios_total_selected = _serialize_items_with_char_budget(
         compact_usuarios,
-        max_chars=2600,
+        max_chars=_int_env("FIREBASE_RUNTIME_MAX_CHARS_USUARIOS", 2800),
     )
     usuarios_all_json, usuarios_all_included, usuarios_all_total_selected = _serialize_items_with_char_budget(
         compact_usuarios_all,
-        max_chars=2100,
+        max_chars=_int_env("FIREBASE_RUNTIME_MAX_CHARS_USUARIOS_ALL", 2600),
     )
 
     context_text = (
