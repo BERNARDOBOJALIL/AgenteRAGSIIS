@@ -68,6 +68,8 @@ Reglas obligatorias:
 - Incluye horarios detallados solo cuando el usuario lo pida explícitamente.
 
 Uso de tools:
+- Minimiza el consumo de tokens: usa la menor cantidad de tools posible para resolver la pregunta.
+- Solo solicita include_schedule/include_details cuando el usuario pida horarios o agenda detallada de forma explicita.
 - Para preguntas sobre equipos, máquinas, instrumentos o herramientas del IDIT (características técnicas,
   especificaciones, ubicación, responsable, mantenimiento, uso permitido), usa buscar_equipos_idit.
   Si el usuario menciona una sección específica (ej. FABLAB, ELECTRONICA), pasa ese dato al parámetro seccion.
@@ -1148,7 +1150,7 @@ def _fallback_match_salones_by_fields(
 
 
 @tool("buscar_salones_idit")
-def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool = True) -> str:
+def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool = False) -> str:
     """Busca salones y servicios del IDIT en datos operativos en vivo.
 
     Usa esta tool cuando la consulta del usuario trate de ubicacion de salones,
@@ -1292,11 +1294,11 @@ def buscar_salones_idit(query: str, max_matches: int = 5, include_schedule: bool
         },
     }
 
-    return json.dumps(payload, ensure_ascii=False)
+    return _safe_json_with_budget(payload, max_chars=2600)
 
 
 @tool("buscar_personal_idit")
-def buscar_personal_idit(query: str, max_matches: int = 5, include_schedule: bool = True) -> str:
+def buscar_personal_idit(query: str, max_matches: int = 5, include_schedule: bool = False) -> str:
     """Busca personal academico del IDIT y su contexto operativo basico.
 
     Usa esta tool cuando el usuario pregunte por profesores/personal (quien es,
@@ -1356,11 +1358,11 @@ def buscar_personal_idit(query: str, max_matches: int = 5, include_schedule: boo
         },
     }
 
-    return json.dumps(payload, ensure_ascii=False)
+    return _safe_json_with_budget(payload, max_chars=2600)
 
 
 @tool("obtener_agenda_personal_idit")
-def obtener_agenda_personal_idit(query: str, max_matches: int = 3, include_details: bool = True) -> str:
+def obtener_agenda_personal_idit(query: str, max_matches: int = 3, include_details: bool = False) -> str:
     """Obtiene agenda operativa completa de personal academico del IDIT.
 
     Usa esta tool cuando la consulta requiera detalle de agenda: horario,
@@ -1422,7 +1424,7 @@ def obtener_agenda_personal_idit(query: str, max_matches: int = 3, include_detai
         },
     }
 
-    return json.dumps(payload, ensure_ascii=False)
+    return _safe_json_with_budget(payload, max_chars=2600)
 
 
 def _normalize_salon_code(value: Any) -> str:
@@ -1466,9 +1468,9 @@ def _truncate_context_block(text: str, max_chars: int) -> str:
 
 def _history_to_messages(historial: list[dict]) -> list[BaseMessage]:
     messages: list[BaseMessage] = []
-    for turno in historial[-4:]:
-        pregunta_hist = _truncate_history_text(str(turno.get("pregunta") or ""), max_chars=350)
-        respuesta_hist = _truncate_history_text(str(turno.get("respuesta") or ""), max_chars=350)
+    for turno in historial[-2:]:
+        pregunta_hist = _truncate_history_text(str(turno.get("pregunta") or ""), max_chars=220)
+        respuesta_hist = _truncate_history_text(str(turno.get("respuesta") or ""), max_chars=220)
         if pregunta_hist:
             messages.append(HumanMessage(content=pregunta_hist))
         if respuesta_hist:
@@ -1626,7 +1628,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 ]
             }
 
-        docs = vector_store.similarity_search(query, k=6, filter=where_filter)
+        docs = vector_store.similarity_search(query, k=4, filter=where_filter)
 
         matches = []
         seen_machines = set()
@@ -1643,7 +1645,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 "responsable": meta.get("responsable", ""),
                 "actualizacion": meta.get("actualizacion", ""),
                 "chunk_type": meta.get("chunk_type", ""),
-                "contenido": doc.page_content[:1200],
+                "contenido": doc.page_content[:650],
             })
 
         payload = {
@@ -1657,7 +1659,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 "collection": COLLECTION_NAME,
             },
         }
-        return json.dumps(payload, ensure_ascii=False)
+        return _safe_json_with_budget(payload, max_chars=2600)
 
     @tool("buscar_informacion_idit")
     def buscar_informacion_idit(query: str, categoria: str = "") -> str:
@@ -1686,7 +1688,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 ]
             }
 
-        docs = vector_store.similarity_search(query, k=5, filter=where_filter)
+        docs = vector_store.similarity_search(query, k=4, filter=where_filter)
 
         matches = []
         for doc in docs:
@@ -1696,7 +1698,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 "categoria": meta.get("categoria", ""),
                 "url": meta.get("url", ""),
                 "fecha": meta.get("fecha_normalizacion_utc", ""),
-                "contenido": doc.page_content[:1000],
+                "contenido": doc.page_content[:600],
             })
 
         payload = {
@@ -1710,7 +1712,7 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
                 "collection": COLLECTION_NAME,
             },
         }
-        return json.dumps(payload, ensure_ascii=False)
+        return _safe_json_with_budget(payload, max_chars=2600)
     
     tools = [
         buscar_salones_idit,
@@ -1734,11 +1736,11 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
             frontend_context=frontend_context,
         )
         firebase_context = str(firebase_runtime.get("context_text") or "Sin datos operativos")
-        raw_context_limit = os.getenv("AGENT_FIREBASE_CONTEXT_MAX_CHARS", "1600")
+        raw_context_limit = os.getenv("AGENT_FIREBASE_CONTEXT_MAX_CHARS", "1100")
         try:
-            firebase_context_max_chars = max(600, int(str(raw_context_limit).strip() or "1600"))
+            firebase_context_max_chars = max(500, int(str(raw_context_limit).strip() or "1100"))
         except ValueError:
-            firebase_context_max_chars = 1600
+            firebase_context_max_chars = 1100
         firebase_context_for_prompt = _truncate_context_block(firebase_context, firebase_context_max_chars)
         debug_trace = dict(state.get("debug_trace") or {})
         debug_trace["firebase_totals"] = (
@@ -1759,13 +1761,14 @@ def build_graph(vector_store: Chroma, frontend_context: str | None = None):
         context_block = (
             "[DATOS OPERATIVOS EN VIVO - FIREBASE]\n"
             f"{firebase_context_for_prompt}\n\n"
-            "[PREGUNTA ORIGINAL]\n"
-            f"{original_question}\n\n"
-            "[PREGUNTA NORMALIZADA]\n"
-            f"{question}\n\n"
-            "[PREGUNTA]\n"
-            f"{question}"
+            "[PREGUNTA DEL USUARIO]\n"
+            f"{original_question}"
         )
+        if question and question != original_question:
+            context_block += (
+                "\n\n[PREGUNTA NORMALIZADA]\n"
+                f"{question}"
+            )
 
         return {
             "chroma_context": "",
