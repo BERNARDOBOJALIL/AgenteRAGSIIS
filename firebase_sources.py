@@ -299,28 +299,79 @@ def _service_account_from_env(
     json_var: str | None,
     fallback_file_names: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Carga service account desde archivo o JSON/base64 en variables de entorno."""
-    candidates: list[tuple[str | None, str]] = []
-    if file_var:
-        candidates.append((os.getenv(file_var, "").strip(), f"env:{file_var}"))
+    """Carga service account desde archivo o JSON/base64 en variables de entorno.
+    
+    Prioridad:
+    1. JSON/base64 vars (json_var y genéricas)
+    2. File vars (file_var)
+    3. Fallback local files
+    """
 
-    for file_name in fallback_file_names or []:
-        candidates.append((file_name, f"local_default:{file_name}"))
+    def _parse_service_account_value(raw_value: str) -> dict[str, Any] | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
 
-    candidates.append((os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(), "env:GOOGLE_APPLICATION_CREDENTIALS"))
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
 
-    for path, source in candidates:
-        if not path:
+        try:
+            decoded = base64.b64decode(text).decode("utf-8")
+            payload = json.loads(decoded)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+        return None
+
+    # 1. Intentar JSON/base64 vars primero (no generan warnings si no existen)
+    json_candidates: list[tuple[str | None, str]] = []
+    if json_var:
+        json_candidates.append((os.getenv(json_var, "").strip(), f"env:{json_var}"))
+        json_candidates.append((os.getenv(f"{json_var}_BASE64", "").strip(), f"env:{json_var}_BASE64"))
+
+    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON"))
+    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON_BASE64", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON_BASE64"))
+
+    for raw_value, source in json_candidates:
+        if not raw_value:
             continue
+        payload = _parse_service_account_value(raw_value)
+        if payload is not None:
+            return payload, source
+
+    # 2. Intentar file vars (solo si JSON falló)
+    file_candidates: list[tuple[str | None, str]] = []
+    if file_var:
+        file_candidates.append((os.getenv(file_var, "").strip(), f"env:{file_var}"))
+
+    file_candidates.append((os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(), "env:GOOGLE_APPLICATION_CREDENTIALS"))
+
+    for raw_value, source in file_candidates:
+        if not raw_value:
+            continue
+
+        # Primero intenta como JSON/base64 (por si la variable contiene JSON directamente)
+        payload = _parse_service_account_value(raw_value)
+        if payload is not None:
+            return payload, source
+
+        # Luego intenta como ruta de archivo
         resolved_path = ""
-        for candidate_path in _resolve_path_candidates(path):
+        for candidate_path in _resolve_path_candidates(raw_value):
             if os.path.exists(candidate_path):
                 resolved_path = candidate_path
                 break
 
         if not resolved_path:
-            log.warning("Ruta de credencial no existe (%s): %s", source, path)
+            log.debug("Ruta de credencial no existe (%s): %s", source, raw_value)
             continue
+
         try:
             with open(resolved_path, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
@@ -329,30 +380,20 @@ def _service_account_from_env(
         except Exception as exc:
             log.warning("No se pudo leer credencial JSON (%s): %s", source, exc)
 
-    json_candidates: list[tuple[str | None, str]] = []
-    if json_var:
-        json_candidates.append((os.getenv(json_var, "").strip(), f"env:{json_var}"))
-        json_candidates.append((os.getenv(f"{json_var}_BASE64", "").strip(), f"env:{json_var}_BASE64"))
-    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON"))
-    json_candidates.append((os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON_BASE64", "").strip(), "env:FIREBASE_SERVICE_ACCOUNT_JSON_BASE64"))
-
-    for raw, source in json_candidates:
-        if not raw:
+    # 3. Fallback a archivos locales
+    for file_name in fallback_file_names or []:
+        if not file_name:
             continue
-        try:
-            payload = json.loads(raw)
-            if isinstance(payload, dict):
-                return payload, source
-        except Exception:
-            pass
-
-        try:
-            decoded = base64.b64decode(raw).decode("utf-8")
-            payload = json.loads(decoded)
-            if isinstance(payload, dict):
-                return payload, source
-        except Exception as exc:
-            log.warning("No se pudo parsear service account desde %s: %s", source, exc)
+        for candidate_path in _resolve_path_candidates(file_name):
+            if not os.path.exists(candidate_path):
+                continue
+            try:
+                with open(candidate_path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                if isinstance(payload, dict):
+                    return payload, f"local_default:{file_name}"
+            except Exception as exc:
+                log.warning("No se pudo leer credencial JSON (local_default:%s): %s", file_name, exc)
 
     return None, ""
 

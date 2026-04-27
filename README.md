@@ -92,22 +92,23 @@ FIREBASE_RUNTIME_CACHE_TTL_SECONDS=45
 ### Acceso total recomendado (Firebase Admin SDK)
 
 Para acceder a todas las colecciones/subcolecciones de ambos proyectos sin limites de descubrimiento REST,
-configura service account por proyecto (archivo o JSON en variable):
+configura service account por proyecto. En Render usa variables de entorno con el JSON completo o en base64; no dependas de rutas locales.
 
 ```env
 # Proyecto salones
-FIREBASE_SALONES_SERVICE_ACCOUNT_FILE=C:/ruta/sa-salones.json
-# O equivalente embebido:
-# FIREBASE_SALONES_SERVICE_ACCOUNT_JSON={...json...}
+FIREBASE_SALONES_SERVICE_ACCOUNT_JSON={...json...}
+# O en base64:
 # FIREBASE_SALONES_SERVICE_ACCOUNT_JSON_BASE64=...
 
 # Proyecto usuarios
-FIREBASE_USERS_SERVICE_ACCOUNT_FILE=C:/ruta/sa-usuarios.json
-# O equivalente embebido:
-# FIREBASE_USERS_SERVICE_ACCOUNT_JSON={...json...}
+FIREBASE_USERS_SERVICE_ACCOUNT_JSON={...json...}
+# O en base64:
 # FIREBASE_USERS_SERVICE_ACCOUNT_JSON_BASE64=...
 
-# Defaults locales en este repo (si no defines variables anteriores):
+# Opcional en desarrollo local:
+# FIREBASE_SALONES_SERVICE_ACCOUNT_FILE=C:/ruta/sa-salones.json
+# FIREBASE_USERS_SERVICE_ACCOUNT_FILE=C:/ruta/sa-usuarios.json
+# Defaults locales en este repo:
 # - siis-d3571-336618a9b5d1.json (salones)
 # - siis-9593c-611399213026.json (usuarios)
 ```
