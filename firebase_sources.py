@@ -1574,18 +1574,22 @@ def _build_client_from_env(
             )
         else:
             try:
-                return FirestoreAdminClient(
+                admin_client = FirestoreAdminClient(
                     project_id=effective_project_id,
                     service_account=service_account,
                     app_name=admin_app_name or f"admin_{effective_project_id}",
                 )
+                log.debug("Cliente Firestore Admin inicializado exitosamente (%s)", source)
+                return admin_client
             except Exception as exc:
-                log.warning("No se pudo inicializar cliente Firestore Admin (%s): %s", source, exc)
+                log.warning("No se pudo inicializar cliente Firestore Admin (%s). Fallback a REST API: %s", source, exc)
+                # Continue to try REST API below
 
     if not project_id or not api_key:
         log.warning("Faltan variables %s o %s. Se omite esta fuente Firestore.", project_var, api_key_var)
         return None
 
+    log.debug("Usando FirestoreRESTClient para %s (project_id: %s)", project_var, project_id[:20] + "...")
     return FirestoreRESTClient(project_id=project_id, api_key=api_key)
 
 
@@ -1780,7 +1784,16 @@ def _record_payload(record: FirestoreRecord, source_name: str) -> dict[str, Any]
 
 
 def fetch_salones_raw_records() -> list[dict[str, Any]]:
-    """Obtiene toda la informacion de salones en formato crudo (sin Markdown)."""
+    """Obtiene toda la informacion de salones en formato crudo (sin Markdown).
+    
+    Intenta dos estrategias:
+    1. Con service account (admin client) si está disponible
+    2. Si falla o retorna vacío, intenta con REST API como fallback
+    """
+    project_id = os.getenv("VITE_FIREBASE_SALONES_PROJECT_ID", "").strip()
+    api_key = os.getenv("VITE_FIREBASE_SALONES_API_KEY", "").strip()
+    
+    # Estrategia 1: Intentar con admin client (service account)
     client = _build_client_from_env(
         "VITE_FIREBASE_SALONES_PROJECT_ID",
         "VITE_FIREBASE_SALONES_API_KEY",
@@ -1789,25 +1802,55 @@ def fetch_salones_raw_records() -> list[dict[str, Any]]:
         fallback_service_account_files=[DEFAULT_LOCAL_SALONES_SERVICE_ACCOUNT_FILE],
         admin_app_name="firebase_admin_salones",
     )
-    if client is None:
-        return []
+    
+    if client is not None:
+        include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", True)
+        max_depth = _optional_int_env("FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH", None)
+        collection_allowlist = _collection_allowlist_env(
+            "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
+            "FIREBASE_SALONES_COLLECTIONS",
+        )
 
-    include_subcollections = _bool_env("FIREBASE_SALONES_INCLUDE_SUBCOLLECTIONS", True)
-    max_depth = _optional_int_env("FIREBASE_SALONES_MAX_TRAVERSAL_DEPTH", None)
-    collection_allowlist = _collection_allowlist_env(
-        "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
-        "FIREBASE_SALONES_COLLECTIONS",
-    )
+        salones: list[dict[str, Any]] = []
+        try:
+            for record in client.iter_documents(
+                collection_allowlist=collection_allowlist,
+                include_subcollections=include_subcollections,
+                max_depth=max_depth,
+            ):
+                salones.append(_record_payload(record, "firebase_salones"))
+        except Exception as exc:
+            log.warning("Error iterando documentos con cliente actual (posible fallo de permisos): %s", exc)
+            salones = []
 
-    salones: list[dict[str, Any]] = []
-    for record in client.iter_documents(
-        collection_allowlist=collection_allowlist,
-        include_subcollections=include_subcollections,
-        max_depth=max_depth,
-    ):
-        salones.append(_record_payload(record, "firebase_salones"))
+        # Si obtuvimos datos, retornarlos
+        if salones:
+            return salones
+        
+        log.info("Primera estrategia (admin client) retornó 0 salones. Intentando con REST API...")
 
-    return salones
+    # Estrategia 2: Fallback a REST API si admin falló o retornó vacío
+    if project_id and api_key:
+        log.info("Intentando cargar salones con REST API (fallback)")
+        rest_client = FirestoreRESTClient(project_id=project_id, api_key=api_key)
+        
+        collection_allowlist = _collection_allowlist_env(
+            "FIREBASE_SALONES_COLLECTION_ALLOWLIST",
+            "FIREBASE_SALONES_COLLECTIONS",
+        ) or ["salones"]
+        
+        salones: list[dict[str, Any]] = []
+        try:
+            for record in rest_client.iter_documents(collection_allowlist=collection_allowlist, include_subcollections=False):
+                salones.append(_record_payload(record, "firebase_salones"))
+            
+            if salones:
+                log.info("REST API exitosa: se obtuvieron %d salones", len(salones))
+                return salones
+        except Exception as exc:
+            log.warning("REST API también falló: %s", exc)
+    
+    return []
 
 
 def fetch_target_users_raw_records(
